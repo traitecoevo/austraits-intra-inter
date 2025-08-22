@@ -16,6 +16,8 @@ library(tidyverse)
 library(glmmTMB)
 library(easystats)
 library(broom.mixed)
+library(arrow)
+library(modelbased)
 
 data_traits_climate <-
   arrow::read_parquet("data-processed/data_traits_climate.parquet") |>
@@ -152,7 +154,7 @@ ggsave("outputs/lma_species_panel.png", p_fit)
 
 ```{r}
 # model across species means
-parameters(fit2)
+parameters::parameters(fit2)
 ```
 
 Plot random slopes. These are deviations from the average species response, which is negative. They should be centred around zero, which they are. 
@@ -185,12 +187,18 @@ traits <- c(
 )
 
 fits <- list()
+
+climates <- c("log_annual_precipitation","average_temperature")
+
 for (trait in traits) {
+  for (climate in climates) {
+
   cat(trait, ":  ")
   data_model <- data_traits_climate |>
     filter(trait_name == trait)
-  fits[[trait]] <- fit_model_1D(data_model)
-  ggsave(sprintf("outputs/%s_species_panel.png", trait), fits[[trait]]$plot_fitted)
+  fits[[trait]] <- fit_model_1D(data_model, seed = 123, ind_variable= climate)
+  ggsave(sprintf("outputs/%s_species_panel.png", paste0(trait,"_",climate)), fits[[trait]]$plot_fitted)
+  }
 }
 ```
 
