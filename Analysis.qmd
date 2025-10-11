@@ -18,28 +18,62 @@ library(easystats)
 library(broom.mixed)
 library(arrow)
 library(modelbased)
+library(tmbstan)
+```
 
+```{r}
+rstan_options(auto_write = TRUE)
+```
+
+```{r}
 data_traits_climate <-
-  arrow::read_parquet("data-processed/data_traits_climate.parquet") |>
-  select(decimal_longitude:life_stage, growth_form_simpler, life_history, woody) |>
+  arrow::read_parquet("data-processed/data_traits_climate.parquet")
+```
+
+```{r}
+data_traits_climate |>
+  pull(taxon_name) |>
+  unique() |> 
+  length()
+```
+
+```{r}
+data_traits_climate <- data_traits_climate |>
+select(decimal_longitude:life_stage, growth_form_simpler, life_history, woody) |>
+  mutate(value = ifelse(trait_name == "leaf_delta13C",(-8 - value) / (1+(value/1000)), value)) %>% 
   mutate(
     log_annual_precipitation = log(annual_precipitation),
     log_value = log(value)
   ) |>
   # Let's also collect the mean rainfall and temp for each species, and devitations of each from their respective mean
+  group_by(taxon_name, cell) |>
+  nest() |>
+  mutate(
+    log_annual_precipitation_cell = map_dbl(data, ~.x$log_annual_precipitation[1]),
+    average_temperature_cell = map_dbl(data, ~.x$average_temperature[1])
+  ) |>
   group_by(taxon_name) |>
   mutate(
-    log_annual_precipitation_mn = mean(log_annual_precipitation),
-    log_annual_precipitation_c = log_annual_precipitation - log_annual_precipitation_mn,
-    average_temperature_mn = mean(average_temperature),
-    average_temperature_c = average_temperature - average_temperature_mn
+    log_annual_precipitation_mn = mean(log_annual_precipitation_cell),
+    # log_annual_precipitation_c = log_annual_precipitation - log_annual_precipitation_mn,
+    average_temperature_mn = mean(average_temperature_cell)
+    # ,
+    # average_temperature_c = average_temperature - average_temperature_mn
   ) |>
+  unnest(data) |>
   ungroup() |>
-  # add a site index, based on unqiue lat, longley
-  mutate(site_id = paste(decimal_longitude, decimal_latitude, sep= "-"))
+  mutate(log_annual_precipitation_c = log_annual_precipitation - log_annual_precipitation_mn,
+    average_temperature_c = average_temperature - average_temperature_mn) |>
+  # # add a site index, based on unqiue lat, longley
+  # mutate(site_id = paste(decimal_longitude, decimal_latitude, sep= "-")) |>
+  #filter out species that have only cell occurrence
+  group_by(taxon_name) |>
+  mutate(ncell = length(unique((cell)))) |> 
+  ungroup() |>
+  filter(ncell > 1)
 
-data_traits_climate_woody <- data_traits_climate |>
-  filter(woody == "woody")
+# data_traits_climate_woody <- data_traits_climate |>
+#   filter(woody == "woody")
 ```
 
 # Comapring two methods: Straight Mixed effects models vs Cornwell-Ackerly Method
@@ -49,7 +83,7 @@ Let's try within species for LMA
 ```{r}
 trait <- "leaf_mass_per_area"
 
-data_model <- data_traits_climate_woody |>
+data_model <- data_traits_climate |>
   filter(trait_name == trait)
 
 # model across species means
@@ -106,19 +140,21 @@ data_fit2 <-
     value = exp(log_value),
     value_mn = exp(log_value_mn),
   )
-
+set.seed(123)
 # Choose a subset of taxa to plot. We'll choose randomly, but restrict to those with multiple sites and records
 taxa <- data_model |>
   group_by(taxon_name) |>
   summarise(
+    # how many observations for that taxon
     n = n(),
+    # how many distinct sites # TODO: cell ID
     n_sites = n_distinct(annual_precipitation)
   ) |>
   ungroup() |>
-  filter(n > 4, n_sites > 4) |>
+  filter(n > 4, n_sites > 2) |>
   pull(taxon_name) |>
   unique() |>
-  sample(30)
+  sample(15)
 
 data_model_taxa <- data_model |>
   filter(taxon_name %in% taxa) |>
@@ -149,7 +185,7 @@ p_fit <-
   theme(legend.position = "none") +
   facet_wrap(~taxon2)
 
-ggsave("outputs/lma_species_panel.png", p_fit)
+ggsave("outputs/lma_species_panel_species.png", p_fit)
 ```
 
 ```{r}
@@ -211,5 +247,303 @@ names(fits[["leaf_mass_per_area"]])
 parameters(fits[["leaf_mass_per_area"]][["fit"]])
 
 parameters(fits[["wood_density"]][["fit"]])
+```
+
+# Two environmental parameters
+
+Interaction model doesn't appear to be possible for leaf mass per area at least
+
+```{r}
+fit3 <- glmmTMB(log_value ~ log_annual_precipitation_mn + log_annual_precipitation_c + average_temperature_mn + average_temperature_c + (log_annual_precipitation_c | taxon_name) + (average_temperature_c | taxon_name), data = data_model)
+
+fit4 <- glmmTMB(log_value ~ log_annual_precipitation_mn*average_temperature_mn + log_annual_precipitation_c*average_temperature_c + (log_annual_precipitation_c | taxon_name)+ (average_temperature_c | taxon_name) + (log_annual_precipitation_c | taxon_name)+ (log_annual_precipitation_c:average_temperature_c | taxon_name), data = data_model)
+```
+
+# Fitting Bayesian models of 2d models for relative contribution question
+
+```{r}
+source("R/fit_model2d_bayesian.R")
+
+traits <- data_traits_climate$trait_name %>% unique()
+traits <- traits[c(2,3,7,9)]
+options(mc.cores = 4)
+fits_bayesian <- list()
+
+for (trait in traits) {
+  cat(trait, ":  ")
+  data_model <- data_traits_climate |>
+    filter(trait_name == trait)
+  fits_bayesian[[trait]] <- fit_model2d_bayesian(data_model)
+}
+```
+
+
+```{r}
+traits <- traits[c(1:5)]
+fits_bayesian <- list()
+posterior_matrix_in <- list()
+
+for (trait in traits) {
+  fits_bayesian[[trait]] <- readRDS(paste0("outputs/model_fits/",trait,".RDS"))
+  
+  # overall fitted - with REs
+data_fit2_re <- estimate_expectation(fits_bayesian[["leaf_mass_per_area"]][[1]]) |>
+  data_fit2_re |>
+  as_tibble() |>
+  # group_by(taxon_name) |> 
+  mutate(average_temperature_mn = mean(average_temperature_mn)) |> 
+  mutate(average_temperature_c = 0) -> data_fit2_re
+
+data_traits_climate %>%
+  filter(trait_name == "leaf_mass_per_area") -> data_model
+
+# Global prediction - change in species mean trait with climate
+data_fit2_global <- estimate_means(fits_bayesian[["leaf_mass_per_area"]][[1]], by = "log_annual_precipitation_mn") |>
+  as_tibble() |>
+  # change variable names so these will plot ok
+  select(log_annual_precipitation = log_annual_precipitation_mn, log_value = Mean) |>
+  # backtransform so we can plot on raw scale
+  mutate(
+    annual_precipitation = exp(log_annual_precipitation),
+    value = exp(log_value),
+    # need a taxon name for plotting
+    taxon_name = "global average"
+  )
+
+# caluclate species means by removing devistations from center
+data_fit2_mn <- estimate_expectation(fits_bayesian[["leaf_mass_per_area"]][[1]],
+  data = data_fit2_re |> mutate(log_annual_precipitation_c = 0) |> group_by(taxon_name) |> mutate(average_temperature_mn = mean(average_temperature_mn)) |> mutate(average_temperature_c = 0) |> select(-Predicted) |> distinct()
+) |>
+  as_tibble() |>
+  distinct()
+
+# combine
+data_fit2 <-
+  data_fit2_re |>
+  rename(log_value = Predicted) |>
+  select(-SE, -Residuals) |>
+  left_join(
+    by = c("log_annual_precipitation_mn", "taxon_name"),
+    data_fit2_mn |> select(log_annual_precipitation_mn, taxon_name, log_value_mn = Predicted)
+  ) |>
+  mutate(
+    log_annual_precipitation = log_annual_precipitation_mn + log_annual_precipitation_c,
+    annual_precipitation = exp(log_annual_precipitation),
+    annual_precipitation_mn = exp(log_annual_precipitation_mn),
+    value = exp(log_value),
+    value_mn = exp(log_value_mn),
+  )
+
+p_fit <-
+  data_fit2 |>
+  ggplot(aes(annual_precipitation, value, group = taxon_name)) +
+  # raw data
+  geom_point(alpha = 0.5, col = "grey", data = data_model, stroke = 0) +
+  # fitted lines
+  geom_line(alpha = 0.5, col = "black", linewidth = 0.25) +
+  # highlight certain species
+  # geom_point(aes(group = taxon2), col = "orange", show.legend = FALSE, data = data_model_taxa, size = 0.9, stroke = 0) +
+  # geom_line(aes(group = taxon2), col = "#d95f02", alpha = 1, show.legend = FALSE, data = data_fit2_taxa) +
+  # global line
+  geom_line(data = data_fit2_global, col = "red") +
+  # species centers
+  # geom_point(aes(x = annual_precipitation_mn, y = value_mn, group = taxon2), col = "red", alpha = 1, size = 0.9,stroke = 0, data = data_fit2_taxa) +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_classic() +
+  labs(y = trait, x = "annual rainfall") +
+  theme(legend.position = "none")
+  
+  
+  
+  estimate_expectation(fits_bayesian[["leaf_mass_per_area"]][[2]])
+  posterior_matrix_in[[trait]] <- posterior::as_draws_matrix(fits_bayesian[[trait]][[2]])%>%
+  as_tibble() %>%
+  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
+  mutate(trait_name = trait)
+}
+
+fits_bayesian$huber_value
+
+summary(fits_bayesian$leaf_mass_per_area[[1]])
+
+fits_bayesian$leaf_mass_per_area[[2]]
+posterior_matrix <- posterior::as_draws_matrix(fits_bayesian$leaf_mass_per_area[[2]])%>%
+  as_tibble() %>%
+  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
+  mutate(trait_name = "leaf_mass_per_area")
+
+posterior_matrix2 <- posterior::as_draws_matrix(fits_bayesian$huber_value)%>%
+  as_tibble() %>%
+  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
+  mutate(trait_name = "huber_value")
+
+
+posterior_matrix %>%
+  bind_rows(posterior_matrix2) %>%
+  mutate(ratio = prec_c/prec_mn) %>%
+  pivot_longer(cols = -c(trait_name,ratio), names_to = "climate") %>%
+      mutate(climate = ifelse(str_sub(climate, start = -2) == "_c", paste0(climate,"e"),climate)) %>%
+    separate(climate, -2, into = c("climate_sep","type"), remove = FALSE) %>%
+  pivot_wider(cols = c(type,value))%>%
+  filter(climate_sep == "prec_")%>%
+  # mutate(type = ifelse())
+  # mutate(trait = trait) %>%
+  # mutate(climate = interaction(climate_sep,trait)) %>%
+  ggplot(aes(x = value, y =  type, colour = type, fill = type)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggridges::geom_density_ridges(panel_scaling = TRUE) +
+  facet_wrap(~trait_name, scales = "free") +
+  theme_bw() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) 
+
+%>%
+  pivot_wider(cols = contains())
+  mutate(trait = "Leaf mass per area") %>%
+  
+  ggplot(aes(x = value, y = trait)) +
+  geom_density() +
+  facet_wrap()
+```
+
+
+```{r}
+traits <- traits[c(1:5)]
+fits_bayesian <- list()
+posterior_matrix_in <- list()
+
+for (trait in traits) {
+  fits_bayesian[[trait]] <- readRDS(paste0("outputs/model_fits/",trait,".RDS"))
+  
+  posterior_matrix_in[[trait]] <- posterior::as_draws_matrix(fits_bayesian[[trait]][[2]])%>%
+  as_tibble() %>%
+  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
+  mutate(trait_name = trait)
+}
+
+fits_bayesian$huber_value
+
+summary(fits_bayesian$leaf_mass_per_area[[1]])
+
+fits_bayesian$leaf_mass_per_area[[2]]
+posterior_matrix <- posterior::as_draws_matrix(fits_bayesian$leaf_mass_per_area[[2]])%>%
+  as_tibble() %>%
+  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
+  mutate(trait_name = "leaf_mass_per_area")
+
+posterior_matrix2 <- posterior::as_draws_matrix(fits_bayesian$huber_value)%>%
+  as_tibble() %>%
+  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
+  mutate(trait_name = "huber_value")
+
+
+posterior_matrix %>%
+  bind_rows(posterior_matrix2) %>%
+  mutate(ratio = prec_c/prec_mn) %>%
+  pivot_longer(cols = -c(trait_name,ratio), names_to = "climate") %>%
+      mutate(climate = ifelse(str_sub(climate, start = -2) == "_c", paste0(climate,"e"),climate)) %>%
+    separate(climate, -2, into = c("climate_sep","type"), remove = FALSE) %>%
+  pivot_wider(cols = c(type,value))%>%
+  filter(climate_sep == "prec_")%>%
+  # mutate(type = ifelse())
+  # mutate(trait = trait) %>%
+  # mutate(climate = interaction(climate_sep,trait)) %>%
+  ggplot(aes(x = value, y =  type, colour = type, fill = type)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggridges::geom_density_ridges(panel_scaling = TRUE) +
+  facet_wrap(~trait_name, scales = "free") +
+  theme_bw() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) 
+
+%>%
+  pivot_wider(cols = contains())
+  mutate(trait = "Leaf mass per area") %>%
+  
+  ggplot(aes(x = value, y = trait)) +
+  geom_density() +
+  facet_wrap()
+```
+
+```{r}
+source("R/fit_model2d_bayesian_PFT.R")
+
+traits <- data_traits_climate$trait_name %>% unique()
+options(mc.cores = 4)
+fits_bayesian <- list()
+
+for (trait in traits[4:5]) {
+  cat(trait, ":  ")
+  data_model <- data_traits_climate |>
+    filter(trait_name == trait)
+  fits_bayesian[[trait]] <- fit_model2d_bayesian_PFT(data_model)
+}
+```
+
+
+```{r}
+source("R/fit_model2d.R")
+
+traits <- c(
+  "leaf_mass_per_area", "leaf_area",
+  "leaf_N_per_area", "leaf_P_per_area",
+  "wood_density", "leaf_delta13C"
+)
+
+for (trait in traits) {
+  cat(trait, ":  ")
+  data_model <- data_traits_climate |>
+    filter(growth_form_simpler != "primitive") |>
+    filter(trait_name == trait) 
+  fit_model2d(data_model)
+}
+```
+
+```{r}
+source("R/fit_model2d_PFT.R")
+
+traits <- c(
+  "leaf_mass_per_area", "leaf_area",
+  "leaf_N_per_area", "leaf_P_per_area",
+  "wood_density", "leaf_delta13C"
+)
+
+for (trait in traits) {
+  cat(trait, ":  ")
+  data_model <- data_traits_climate |>
+    filter(growth_form_simpler != "primitive") |>
+    filter(trait_name == trait) |>
+    filter(!(trait_name == "wood_density" & growth_form_simpler %in% c("herb","graminoid")))
+  
+  fit_model2d_PFT(data_model,rerun = TRUE)
+}
+```
+
+```{r}
+
+```
+
+
+```{r}
+source("R/fit_model2d_3panel.R")
+
+traits <- unique(data_traits_climate$trait_name)
+traits <- traits[c(1:5,7,9)]
+fit_model2d_3panel_out <- list()
+
+for (trait in traits) {
+  cat(trait, ":  ")
+  data_model <- data_traits_climate |>
+    filter(growth_form_simpler != "primitive") |>
+    filter(trait_name == trait)
+  fit_model2d_3panel_out[[trait]] <- fit_model2d_3panel(data_model, ind_variable = "log_annual_precipitation")
+}
+
+patchwork::wrap_plots(fit_model2d_3panel_out, ncol = 1, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
+
+ggsave("fit_model2d_3panel_precipitation.png", height = 18, width = 10)
 ```
 

@@ -29,7 +29,7 @@ Load climate covariates from worldclim
 
 
 ```{r}
-vars <- c("wc2.1_2.5m_bio_1.tif", "wc2.1_2.5m_bio_12.tif")
+vars <- c("wc2.1_30s_bio_1.tif", "wc2.1_30s_bio_12.tif")
 
 # Australia
 australia <- terra::rast("data/australia.tif")
@@ -37,7 +37,7 @@ australia <- terra::rast("data/australia.tif")
 # Stacked raster of climate predictors, cropped to Australia
 stacked_rasters <-
   #list.files(wc_path, full.names = TRUE, pattern = ".bil") |>
-  file.path("downloads/wc2.1_2.5m_bio", vars) |>
+  file.path("data/wc2.1_30s_bio", vars) |>
   terra::rast() |>
   terra::crop(australia)
 ```
@@ -48,29 +48,93 @@ stacked_rasters <-
 traits <- c(
   "leaf_mass_per_area", "leaf_area",
   "leaf_N_per_area", "leaf_P_per_area",
-  "wood_density", "leaf_delta13C"
+  "wood_density", "leaf_delta13C",
+  "leaf_N_per_dry_mass", "leaf_P_per_dry_mass",
+  "huber_value","photosynthetic_pathway","leaflet_area"
 )
 
 output <- "data-processed/austraits_geo_climates.parquet"
 
 if (!file.exists(output)) {
-  austraits <- readRDS("data/austraits/austraits-7.0.0.rds") |>
-    austraits::flatten_database()
+  austraits_unflattened <- readRDS("data/austraits-7.0.0.rds")
 
-  austraits_geo <-
+  austraits <- austraits_unflattened |>
+    austraits::flatten_database()
+  
+  # Crous_2019 treatment id 1 and Firn_2019 treatment id 1 are part of experiments but are unmodified, naturally occurring vegetation
+  
+    austraits_geo <-
     austraits |>
     filter(
       trait_name %in% traits,
-      basis_of_record == "field",
+      basis_of_record %in% c("field") | (basis_of_record %in% c("field_experiment") &
+                                           dataset_id %in% c("Crous_2019","Firn_2019") &
+                                           treatment_context_id == "01"),
       !is.na(`latitude (deg)`), !is.na(`longitude (deg)`)
     ) |>
     mutate(across(c("latitude (deg)", "longitude (deg)", value), ~ suppressWarnings(as.numeric(.x)))) |>
     # Remove problematic values
     filter(
-      !is.na(`latitude (deg)`), !is.na(`longitude (deg)`),
-      !(trait_name == "leaf_delta13C" & value < 20)
+      !is.na(`latitude (deg)`), !is.na(`longitude (deg)`)
     )
+    
+  austraits|>
+  filter(trait_name == "leaf_compoundness")|>
+  group_by(taxon_name) |>
+  mutate(num_types = n_distinct(value)) |>
+  ungroup() |>
+  mutate(compoundness = if_else(num_types > 1 | value =="compound" | value == "compound simple", "compound", "simple")) |>
+  dplyr::select(-value) |>
+  distinct(taxon_name, .keep_all = T) |>
+  dplyr::select(compoundness, taxon_name) -> compound_taxa
+  
+  austraits_geo |>
+  filter(trait_name == "leaf_area") |>
+  left_join(compound_taxa) |>
+  group_by(dataset_id) |>
+  mutate(compound_species = if_else(any(is.na(compoundness)) |any(compoundness == "compound") , "compound_present","no_compound")) |>
+  distinct(dataset_id, .keep_all = TRUE) |>
+  dplyr::select(dataset_id, compound_species) |>
+  ungroup()|>
+  mutate(leaf_unit_measured = NA,
+         evidence = NA,
+         notes = NA) %>%
+  write_csv("data/leaf_compound_filter/datasets_with_leaf_area.csv")
+  
+  
+  datasets_with_leaf_area <- read_csv("data/leaf_compound_filter/datasets_with_leaf_area_edited.csv")
+  
+  austraits_geo |>
+    filter(trait_name %in% c("leaf_area")) |>
+    left_join(datasets_with_leaf_area) -> austraits_geo_leaf_area
 
+  austraits_geo_leaf_area |>
+  left_join(compound_taxa) |>
+  filter(!(compound_species == "compound_present" & leaf_unit_measured == "leaf" & compoundness %in% c(NA,"compound"))) |>
+  dplyr::select(-compound_species, -leaf_unit_measured, -evidence, -notes, -compoundness) -> austraits_geo_leaf_area_compound_removed
+  
+  austraits_geo |>
+  filter(!trait_name %in% c("leaf_area")) |>
+  bind_rows(austraits_geo_leaf_area_compound_removed) |>
+  mutate(trait_name = ifelse(trait_name == "leaflet_area","leaf_area",trait_name)) -> austraits_geo
+
+  austraits |>
+    filter(trait_name == "photosynthetic_pathway") |>
+    dplyr::select(taxon_name, value) |>
+    group_by(taxon_name) |> 
+    nest(photosynthetic_pathway = -taxon_name) |>
+    mutate(photosynthetic_pathway = map(photosynthetic_pathway, ~unique(.x$value))) |>
+    mutate(length_pathways = map_dbl(photosynthetic_pathway, ~length(.x))) |>
+    filter(length_pathways == 1) |>
+    unnest(photosynthetic_pathway) |>
+    ungroup() %>%
+    select(taxon_name, photosynthetic_pathway) -> c3_c4_identity
+  
+  austraits_geo %>%
+    left_join(c3_c4_identity) %>%
+    filter(!(trait_name == "leaf_delta13C" & photosynthetic_pathway != "c3")) %>%
+    dplyr::select(-photosynthetic_pathway)-> austraits_geo
+  
   # Add climate data
   trait_data_vect <-
     austraits_geo |>
@@ -81,19 +145,30 @@ if (!file.exists(output)) {
     )
 
   data_traits_climate <-
-    terra::extract(x = stacked_rasters, y = trait_data_vect, method = "simple", bind = TRUE, xy = FALSE, cells = FALSE, ID = FALSE, dataframe = TRUE) |>
+    terra::extract(x = stacked_rasters, y = trait_data_vect, method = "simple", bind = TRUE, xy = FALSE, cells = TRUE, ID = FALSE, dataframe = TRUE) |>
     as_tibble() |>
     bind_cols(austraits_geo) |>
-    rename(decimal_longitude = `longitude (deg)`, decimal_latitude = `latitude (deg)`, annual_precipitation = wc2.1_2.5m_bio_12, average_temperature = wc2.1_2.5m_bio_1) |>
+    rename(decimal_longitude = `longitude (deg)`, decimal_latitude = `latitude (deg)`, annual_precipitation = wc2.1_30s_bio_12, average_temperature = wc2.1_30s_bio_1) |>
     select(decimal_longitude, decimal_latitude, annual_precipitation, average_temperature, everything())
 
-  # Bring in new life history data, not yet on AusTraits
-  data_life_history <-
-    readr::read_csv("data/austraits/life_history.csv") |>
-    dplyr::rename(growth_form = `growth_form...6`) |>
-    dplyr::select(-`growth_form...13`) |>
-    dplyr::select(taxon_name, growth_form, life_history) |>
-    dplyr::distinct() |>
+  species_life_history <-
+  austraits_unflattened |>
+  austraits::extract_dataset("Wenk_2023") |>
+  austraits::extract_trait("life_history") |>
+  pluck("traits") |>
+  select(taxon_name, life_history = value) |>
+  group_by(taxon_name) |>
+    mutate(life_history = paste0(life_history, collapse = " ")) |>
+  ungroup() |>
+  distinct()
+  
+  species_growth_form <-
+  austraits_unflattened |>
+  austraits::extract_dataset("Wenk_2022") |>
+  austraits::extract_trait("growth_form") |>
+  pluck("traits") |>
+  select(taxon_name, growth_form = value) |>
+  distinct()|>
     mutate(
       woody = ifelse(
         !str_detect(growth_form, "herb|fern|tussock|geophyte|lycophyte|basal_large|graminoid"), "woody", "non-woody"
@@ -107,10 +182,14 @@ if (!file.exists(output)) {
         str_detect(growth_form, "graminoid|hummock|tussock") ~ "graminoid",
         str_detect(growth_form, "fern|lycophyte") ~ "primitive"
       )
-    )
+    )|>
+    select(-growth_form) |>
+  distinct()
+  
 
   data_traits_climate |>
-    left_join(by = "taxon_name", data_life_history) |>
+    left_join(by = "taxon_name", species_life_history) |>
+    left_join(by = "taxon_name", species_growth_form) |>
     arrow::write_parquet("data-processed/data_traits_climate.parquet")
 }
 
