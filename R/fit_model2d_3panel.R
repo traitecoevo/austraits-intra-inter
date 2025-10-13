@@ -97,9 +97,8 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
     mutate(!!paste0(standard_name,"_c") := get(paste0(standard_name,"_c_plot")) - get(paste0(standard_name,"_mn"))) %>%
     mutate(taxon_name = "global")
   
-  
   data_c_line %>%
-    mutate(value = as.numeric(f(fixef(fit2)$cond[1] + fixef(fit2)$cond[2]*data_c_line[,paste0(standard_name,"_mn")] +  fixef(fit2)$cond[3]*data_c_line[,paste0(standard_name,"_c")] + fixef(fit2)$cond[4]*data_c_line[,paste0(off_variable,"_mn")] + fixef(fit2)$cond[5]*data_c_line[,paste0(off_variable,"_c")])[1:2,1])) -> data_c_line
+    mutate(value = as.numeric(exp(fixef(fit2)$cond[1] + fixef(fit2)$cond[2]*data_c_line[,"annual_precipitation_mn"] +  fixef(fit2)$cond[3]*data_c_line[,"annual_precipitation_c"] + fixef(fit2)$cond[4]*data_c_line[,"average_temperature_mn"] + fixef(fit2)$cond[5]*data_c_line[,"average_temperature_c"])[1:2,1])) -> data_c_line
   
   # combine
   data_fit2 <-
@@ -117,7 +116,6 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
       value = exp(log_value),
       value_mn = exp(log_value_mn),
     )
-  browser()
   cat("coooking up a sweet plot -> ")
   
   data_model %>%
@@ -137,12 +135,12 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
     mutate(!!ind_variable := f(get(ind_variable)))
   a <-
     data_model |>
-    mutate(!!ind_variable := f(get(ind_variable))) |>
+    mutate(!!ind_variable := as.numeric(f(get(ind_variable)))) |>
     # mutate(predicted_value = data_fit2_re$Predicted) |> 
     ggplot(aes(x = get(standard_name), y = value)) +
     geom_point(alpha = 0.75, col = "grey") +
     # raw data
-    geom_line(data = data_fit2_re_overall, aes(x = (get(ind_variable)), y = exp(Predicted)), size = 1.5) +
+    geom_line(data = data_fit2_re_overall, aes(x = (as.numeric(get(ind_variable))), y = exp(Predicted)), size = 1.5) +
     scale_x_continuous(transform = x_transform) +
     scale_y_log10() +
     theme_classic()  +
@@ -154,11 +152,12 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
   # add red line to this plot
   # hist(coef(fit2)$cond$taxon_name$log_annual_precipitation_c)
   re_strength <- tibble(taxon_name = rownames(coef(fit2)$cond$taxon_name),
-                        re_strength = coef(fit2)$cond$taxon_name$log_annual_precipitation_c)
+                        re_strength = coef(fit2)$cond$taxon_name[[paste0(ind_variable,"_c")]])
   
   data_c_line$re_strength <- as.numeric(fixef(fit2)$cond[paste0(standard_name,"_c")])
   data_c_line |>
     mutate(!!paste0(standard_name, "_c_plot") := f(get(paste0(standard_name, "_c_plot")))) -> data_c_line
+  browser()
   b <-
   data_fit2 |>
     left_join(re_strength) %>%
@@ -212,5 +211,6 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
     theme(legend.position = "none",
           text = element_text(size = 12),
           axis.text = element_text(size = 12)) 
+  browser()
   return(a + b + c)
 }

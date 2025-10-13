@@ -19,6 +19,7 @@ library(broom.mixed)
 library(arrow)
 library(modelbased)
 library(tmbstan)
+library(patchwork)
 ```
 
 ```{r}
@@ -265,7 +266,8 @@ fit4 <- glmmTMB(log_value ~ log_annual_precipitation_mn*average_temperature_mn +
 source("R/fit_model2d_bayesian.R")
 
 traits <- data_traits_climate$trait_name %>% unique()
-traits <- traits[c(2,3,7,9)]
+traits <- traits[c(1,4,5,7,9)]
+# traits <- traits[4:5]
 options(mc.cores = 4)
 fits_bayesian <- list()
 
@@ -279,7 +281,7 @@ for (trait in traits) {
 
 
 ```{r}
-traits <- traits[c(1:5)]
+traits <- traits[c(1:5,7,9)]
 fits_bayesian <- list()
 posterior_matrix_in <- list()
 
@@ -410,7 +412,8 @@ posterior_matrix %>%
 
 
 ```{r}
-traits <- traits[c(1:5)]
+traits <- unique(data_traits_climate$trait_name)
+traits <- traits[c(1:5,7,9)]
 fits_bayesian <- list()
 posterior_matrix_in <- list()
 
@@ -423,49 +426,93 @@ for (trait in traits) {
   mutate(trait_name = trait)
 }
 
-fits_bayesian$huber_value
-
-summary(fits_bayesian$leaf_mass_per_area[[1]])
-
-fits_bayesian$leaf_mass_per_area[[2]]
-posterior_matrix <- posterior::as_draws_matrix(fits_bayesian$leaf_mass_per_area[[2]])%>%
-  as_tibble() %>%
-  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
-  mutate(trait_name = "leaf_mass_per_area")
-
-posterior_matrix2 <- posterior::as_draws_matrix(fits_bayesian$huber_value)%>%
-  as_tibble() %>%
-  select(prec_mn = 'beta[2]', prec_c = 'beta[3]', temp_mn = 'beta[4]',temp_c = 'beta[5]') %>%
-  mutate(trait_name = "huber_value")
+posterior_matrix_in %>%
+    bind_rows() %>%
+    mutate(ratio_prec = prec_c/prec_mn) %>%
+    select(-contains("temp")) |>
+    # mutate(ratio_temp = temp_c/temp_mn)%>%
+    pivot_longer(cols = -c(trait_name), names_to = "climate")%>%
+    mutate(climate = factor(climate, levels = c("ratio_prec", "prec_mn","prec_c"), labels = c(bquote(Ratio), bquote(B[2[Prec]]), bquote(B[1[Prec]])))) |>
+    mutate(trait_name = factor(trait_name, levels = c("huber_value", "leaf_area","leaf_delta13C","leaf_mass_per_area","leaf_N_per_area","leaf_P_per_area","wood_density"), labels = c("SA:LA",bquote(Leaf~area), bquote(Leaf~delta^13*C),"LMA",bquote(Leaf~N[area]),bquote(Leaf~P[area]),bquote(Wood~density)))) %>% group_by(trait_name, climate) %>% summarise(median = median(value), lower_quant = quantile(value, 0.05), upper_quant = quantile(value, 0.95)) -> quants
 
 
-posterior_matrix %>%
-  bind_rows(posterior_matrix2) %>%
-  mutate(ratio = prec_c/prec_mn) %>%
-  pivot_longer(cols = -c(trait_name,ratio), names_to = "climate") %>%
-      mutate(climate = ifelse(str_sub(climate, start = -2) == "_c", paste0(climate,"e"),climate)) %>%
-    separate(climate, -2, into = c("climate_sep","type"), remove = FALSE) %>%
-  pivot_wider(cols = c(type,value))%>%
-  filter(climate_sep == "prec_")%>%
-  # mutate(type = ifelse())
-  # mutate(trait = trait) %>%
-  # mutate(climate = interaction(climate_sep,trait)) %>%
-  ggplot(aes(x = value, y =  type, colour = type, fill = type)) +
+
+
+
+posterior_matrix_in %>%
+  bind_rows() %>%
+  mutate(ratio_prec = prec_c/prec_mn) %>%
+  select(-contains("temp")) |>
+  # mutate(ratio_temp = temp_c/temp_mn)%>%
+  pivot_longer(cols = -c(trait_name), names_to = "climate")%>%
+  mutate(climate = factor(climate, levels = c("ratio_prec", "prec_mn","prec_c"), labels = c(bquote(Ratio), bquote(B[2[Prec]]), bquote(B[1[Prec]])))) |>
+  mutate(trait_name = factor(trait_name, levels = c("huber_value", "leaf_area","leaf_delta13C","leaf_mass_per_area","leaf_N_per_area","leaf_P_per_area","wood_density"), labels = c("SA:LA",bquote(Leaf~area), bquote(Leaf~delta^13*C),"LMA",bquote(Leaf~N[area]),bquote(Leaf~P[area]),bquote(Wood~density)))) |>
+  ggplot(aes(x = as.numeric(value), y = climate)) +
   geom_vline(xintercept = 0, linetype = "dashed") +
-  ggridges::geom_density_ridges(panel_scaling = TRUE) +
-  facet_wrap(~trait_name, scales = "free") +
-  theme_bw() +
+  ggridges::geom_density_ridges(aes(colour = climate, group = climate, fill = climate),alpha=0.5,scale = 0.5,size = 1)+
+  geom_segment(data = quants, aes(y = climate, yend = climate, x = lower_quant, xend = upper_quant), size = 0.5) +
+    geom_point(data = quants, aes(y = climate, x = median), size = 1.5) +
+  facet_wrap(~trait_name, scales = "free_x", labeller = label_parsed, ncol = 2) +
+  theme_classic() +
   theme(axis.title.y = element_blank(),
-        axis.text.y = element_blank(),
-        axis.ticks.y = element_blank()) 
+        axis.title.x = element_blank(),
+        # axis.ticks.y = element_blank(),
+        strip.border = element_rect(color = NA),
+        legend.position = "none",
+          text = element_text(size = 12),
+          axis.text = element_text(size = 12),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 12)) +
+  scale_y_discrete(labels = function(x) parse(text = x)) +
+  scale_colour_manual(values = c("green","orange","purple"))+
+  scale_fill_manual(values = c("green","orange","purple"))
 
-%>%
-  pivot_wider(cols = contains())
-  mutate(trait = "Leaf mass per area") %>%
-  
-  ggplot(aes(x = value, y = trait)) +
-  geom_density() +
-  facet_wrap()
+ggsave("rel_intra_inter_prec.png", height = 7)
+
+
+posterior_matrix_in %>%
+    bind_rows() %>%
+    mutate(ratio_temp = temp_c/temp_mn) %>%
+    select(-contains("prec")) |>
+    # mutate(ratio_temp = temp_c/temp_mn)%>%
+    pivot_longer(cols = -c(trait_name), names_to = "climate")%>%
+    mutate(climate = factor(climate, levels = c("ratio_temp", "temp_mn","temp_c"), labels = c(bquote(Ratio), bquote(B[2[Temp]]), bquote(B[1[Temp]])))) |>
+    mutate(trait_name = factor(trait_name, levels = c("huber_value", "leaf_area","leaf_delta13C","leaf_mass_per_area","leaf_N_per_area","leaf_P_per_area","wood_density"), labels = c("SA:LA",bquote(Leaf~area), bquote(Leaf~delta^13*C),"LMA",bquote(Leaf~N[area]),bquote(Leaf~P[area]),bquote(Wood~density)))) %>% group_by(trait_name, climate) %>% summarise(median = median(value), lower_quant = quantile(value, 0.05), upper_quant = quantile(value, 0.95)) -> quants
+
+
+
+
+
+posterior_matrix_in %>%
+  bind_rows() %>%
+  mutate(ratio_temp = temp_c/temp_mn) %>%
+  select(-contains("prec")) |>
+  # mutate(ratio_temp = temp_c/temp_mn)%>%
+  pivot_longer(cols = -c(trait_name), names_to = "climate")%>%
+  mutate(climate = factor(climate, levels = c("ratio_temp", "temp_mn","temp_c"), labels = c(bquote(Ratio), bquote(B[2[Temp]]), bquote(B[1[Temp]])))) |>
+  mutate(trait_name = factor(trait_name, levels = c("huber_value", "leaf_area","leaf_delta13C","leaf_mass_per_area","leaf_N_per_area","leaf_P_per_area","wood_density"), labels = c("SA:LA",bquote(Leaf~area), bquote(Leaf~delta^13*C),"LMA",bquote(Leaf~N[area]),bquote(Leaf~P[area]),bquote(Wood~density)))) |>
+  ggplot(aes(x = as.numeric(value), y = climate)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggridges::geom_density_ridges(aes(colour = climate, group = climate, fill = climate),alpha=0.5,scale = 0.5,size = 1)+
+  geom_segment(data = quants, aes(y = climate, yend = climate, x = lower_quant, xend = upper_quant), size = 0.5) +
+    geom_point(data = quants, aes(y = climate, x = median), size = 1.5) +
+  facet_wrap(~trait_name, scales = "free_x", labeller = label_parsed, ncol = 2) +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        # axis.ticks.y = element_blank(),
+        strip.border = element_rect(color = NA),
+        legend.position = "none",
+          text = element_text(size = 12),
+          axis.text = element_text(size = 12),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 12)) +
+  scale_y_discrete(labels = function(x) parse(text = x)) +
+  scale_colour_manual(values = c("green","orange","purple"))+
+  scale_fill_manual(values = c("green","orange","purple"))
+
+ggsave("rel_intra_inter_prec.png", height = 7)
+
 ```
 
 ```{r}
@@ -482,6 +529,28 @@ for (trait in traits[4:5]) {
   fits_bayesian[[trait]] <- fit_model2d_bayesian_PFT(data_model)
 }
 ```
+
+```{r}
+source("R/fit_model2d_3panel_PFT.R")
+
+traits <- unique(data_traits_climate$trait_name)
+
+traits <- traits[-c(6,8,10)]
+fit_model2d_3panelPFT_out <- list()
+
+for (trait in traits) {
+  cat(trait, ":  ")
+  data_model <- data_traits_climate |>
+    filter(growth_form_simpler != "primitive") |>
+    filter(trait_name == trait)
+  fit_model2d_3panelPFT_out[[trait]] <- fit_model2d_3panel_PFT(data_model, ind_variable = "log_annual_precipitation")
+}
+
+patchwork::wrap_plots(fit_model2d_3panelPFT_out, ncol = 1, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
+
+ggsave("fit_model2d_3panel_precipitation2.png", height = 18, width = 10)
+```
+
 
 
 ```{r}
@@ -531,7 +600,8 @@ for (trait in traits) {
 source("R/fit_model2d_3panel.R")
 
 traits <- unique(data_traits_climate$trait_name)
-traits <- traits[c(1:5,7,9)]
+
+traits <- traits[-c(6,8,10)]
 fit_model2d_3panel_out <- list()
 
 for (trait in traits) {
@@ -544,6 +614,6 @@ for (trait in traits) {
 
 patchwork::wrap_plots(fit_model2d_3panel_out, ncol = 1, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
 
-ggsave("fit_model2d_3panel_precipitation.png", height = 18, width = 10)
+ggsave("fit_model2d_3panel_precipitation2.png", height = 18, width = 10)
 ```
 
