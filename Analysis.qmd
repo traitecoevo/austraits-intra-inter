@@ -9,6 +9,14 @@ editor_options:
 
 1.  
 
+## Literature
+
+- Cornwell & Ackerly 2009
+- Ogle 2014 - wood density
+- Fischer et al 2025 (in review) - Global Wood Density Database. partition variance at different levels of biological organisation and with and quantify correlations with climate variables. They fit exactly the same structure for the mixed effect model that I ended up using, including the two climate variables, the average species value and the centered deviation from the average. Reassuring that they converged on the same approach. They cite an Gelman reference (guru statistician) where they recommend this approach for LMMs when "Predictors and Group Effects Correlate"  https://doi.org/10.2139/ssrn.1010095
+
+
+
 # Setup
 
 ```{r}
