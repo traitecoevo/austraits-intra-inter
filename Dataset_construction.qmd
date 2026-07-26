@@ -10,15 +10,8 @@ editor_options:
 ```{r}
 library(tidyverse)
 library(terra) # used to extract and process rasters
-library(tictoc) # used to track time processes take
 ```
 
-Reusing data from Cornsters annuals project. To save duplicating that, I'm just going to create a symbolic link to those datasets, to those directories. 
-
-```
-ln -s ../Cornsters-australian_annuals/data data
-ln -s ../Cornsters-australian_annuals/downloads downloads 
-```
 
 ## Get climate covariates
 
@@ -29,14 +22,16 @@ Load climate covariates from worldclim
 
 
 ```{r}
+# Select the two WorldClim bioclimate raster files to load:
+#   BIO_1  = Annual Mean Temperature
+#   BIO_12 = Annual Precipitation
 vars <- c("wc2.1_30s_bio_1.tif", "wc2.1_30s_bio_12.tif")
 
-# Australia
+# Load the Australia boundary raster (used as a crop mask)
 australia <- terra::rast("data/australia.tif")
 
-# Stacked raster of climate predictors, cropped to Australia
+# Load both climate rasters, stack them, and crop to the Australian extent
 stacked_rasters <-
-  #list.files(wc_path, full.names = TRUE, pattern = ".bil") |>
   file.path("data/wc2.1_30s_bio", vars) |>
   terra::rast() |>
   terra::crop(australia)
@@ -45,39 +40,53 @@ stacked_rasters <-
 ## AusTraits
 
 ```{r}
+# Traits of interest for the analysis
 traits <- c(
   "leaf_mass_per_area", "leaf_area",
-  "leaf_N_per_area", "leaf_P_per_area",
+  "leaf_N_per_area",
   "wood_density", "leaf_delta13C",
-  "leaf_N_per_dry_mass", "leaf_P_per_dry_mass",
-  "huber_value","photosynthetic_pathway","leaflet_area"
+  "huber_value","photosynthetic_pathway","leaflet_area","seed_dry_mass"
 )
 
 output <- "data-processed/austraits_geo_climates.parquet"
 
+# Only build the dataset if the output file doesn't already exist (cache check)
 if (!file.exists(output)) {
+  # --- Step 1: Load and flatten the AusTraits database ---
+  # Reads the raw nested RDS and flattens it into a single tidy data frame
   austraits_unflattened <- readRDS("data/austraits-7.0.0.rds")
 
   austraits <- austraits_unflattened |>
     austraits::flatten_database()
-  
-  # Crous_2019 treatment id 1 and Firn_2019 treatment id 1 are part of experiments but are unmodified, naturally occurring vegetation
-  
+  # --- Step 2: Filter to field observations with valid coordinates ---
+  # Keeps only:
+  #   - traits of interest
+  #   - all field records
+  #   - field_experiment records only when they are:
+  #     * Crous_2019 or Firn_2019 with treatment_context_id == "01"
+  #     * Auld_2000 seed_dry_mass records
+  #   - observations that have both latitude and longitude
+
     austraits_geo <-
     austraits |>
     filter(
       trait_name %in% traits,
       basis_of_record %in% c("field") | (basis_of_record %in% c("field_experiment") &
-                                           dataset_id %in% c("Crous_2019","Firn_2019") &
-                                           treatment_context_id == "01"),
+                                           ((dataset_id %in% c("Crous_2019","Firn_2019") &
+                                             treatment_context_id == "01") |
+                                            (dataset_id == "Auld_2000" &
+                                             trait_name == "seed_dry_mass"))),
       !is.na(`latitude (deg)`), !is.na(`longitude (deg)`)
     ) |>
     mutate(across(c("latitude (deg)", "longitude (deg)", value), ~ suppressWarnings(as.numeric(.x)))) |>
-    # Remove problematic values
+    # Drop rows where coordinate conversion produced NAs
     filter(
       !is.na(`latitude (deg)`), !is.na(`longitude (deg)`)
     )
     
+  # --- Step 3: Build a lookup table for leaf compoundness per species ---
+  # Classifies each species as "compound" if it ever has compound leaves,
+  # or "simple" otherwise. Used later to filter leaf area measurements.
   austraits|>
   filter(trait_name == "leaf_compoundness")|>
   group_by(taxon_name) |>
@@ -88,9 +97,12 @@ if (!file.exists(output)) {
   distinct(taxon_name, .keep_all = T) |>
   dplyr::select(compoundness, taxon_name) -> compound_taxa
   
+  # --- Step 4: Flag leaf_area datasets that contain compound-leaved species ---
+  # Exports a CSV for manual review so datasets can be annotated with what leaf
+  # unit was actually measured (whole leaf vs. leaflet).
   austraits_geo |>
   filter(trait_name == "leaf_area") |>
-  left_join(compound_taxa) |>
+  left_join(compound_taxa) |> 
   group_by(dataset_id) |>
   mutate(compound_species = if_else(any(is.na(compoundness)) |any(compoundness == "compound") , "compound_present","no_compound")) |>
   distinct(dataset_id, .keep_all = TRUE) |>
@@ -101,7 +113,10 @@ if (!file.exists(output)) {
          notes = NA) %>%
   write_csv("data/leaf_compound_filter/datasets_with_leaf_area.csv")
   
-  
+  # --- Step 5: Apply the manually edited compound-leaf filter ---
+  # Read back the hand-annotated CSV and remove leaf_area records where the
+  # dataset measured individual leaves but the species is compound (i.e. the
+  # measurement reflects a leaflet, not a whole leaf).
   datasets_with_leaf_area <- read_csv("data/leaf_compound_filter/datasets_with_leaf_area_edited.csv")
   
   austraits_geo |>
@@ -113,29 +128,48 @@ if (!file.exists(output)) {
   filter(!(compound_species == "compound_present" & leaf_unit_measured == "leaf" & compoundness %in% c(NA,"compound"))) |>
   dplyr::select(-compound_species, -leaf_unit_measured, -evidence, -notes, -compoundness) -> austraits_geo_leaf_area_compound_removed
   
+  # Recombine filtered leaf_area rows with all other traits.
+  # Also relabel "leaflet_area" as "leaf_area" so the trait name is consistent.
   austraits_geo |>
   filter(!trait_name %in% c("leaf_area")) |>
   bind_rows(austraits_geo_leaf_area_compound_removed) |>
   mutate(trait_name = ifelse(trait_name == "leaflet_area","leaf_area",trait_name)) -> austraits_geo
 
+  # --- Step 6: Remove non-C3 observations from leaf_delta13C ---
+  # δ13C is only a meaningful water-use efficiency proxy for C3 plants.
+  # Strategy:
+  #   (a) Build a per-species photosynthetic pathway lookup from all AusTraits records,
+  #       restricted to species with a single unambiguous reported pathway.
+  #   (b) Drop leaf_delta13C rows where the pathway is KNOWN and not "c3".
+  #   (c) Retain leaf_delta13C rows with NA pathway (species not in the lookup),
+  #       but drop those with value > -20 ‰ — values this enriched are implausible
+  #       for C3 and most likely represent C4 or CAM individuals.
   austraits |>
     filter(trait_name == "photosynthetic_pathway") |>
     dplyr::select(taxon_name, value) |>
-    group_by(taxon_name) |> 
+    group_by(taxon_name) |>
     nest(photosynthetic_pathway = -taxon_name) |>
     mutate(photosynthetic_pathway = map(photosynthetic_pathway, ~unique(.x$value))) |>
     mutate(length_pathways = map_dbl(photosynthetic_pathway, ~length(.x))) |>
-    filter(length_pathways == 1) |>
+    filter(length_pathways == 1) |>   # keep only species with a single reported pathway
     unnest(photosynthetic_pathway) |>
-    ungroup() %>%
+    ungroup() |>
     select(taxon_name, photosynthetic_pathway) -> c3_c4_identity
+
+  austraits_geo |>
+    left_join(c3_c4_identity, by = "taxon_name") |>
+    filter(
+      # (b) Remove delta13C rows with a known non-C3 pathway
+      !(trait_name == "leaf_delta13C" & !is.na(photosynthetic_pathway) & photosynthetic_pathway != "c3"),
+      # (c) Remove delta13C rows with unknown pathway but value > -20 ‰
+      !(trait_name == "leaf_delta13C" & is.na(photosynthetic_pathway) & as.numeric(value) > -20)
+    ) |>
+    dplyr::select(-photosynthetic_pathway) -> austraits_geo
   
-  austraits_geo %>%
-    left_join(c3_c4_identity) %>%
-    filter(!(trait_name == "leaf_delta13C" & photosynthetic_pathway != "c3")) %>%
-    dplyr::select(-photosynthetic_pathway)-> austraits_geo
-  
-  # Add climate data
+  # --- Step 7: Extract climate values at each observation's coordinates ---
+  # Convert the trait data frame to a spatial vector (points) and extract
+  # temperature and precipitation from the stacked WorldClim rasters.
+  # The raster cell index is also retained to identify co-located observations.
   trait_data_vect <-
     austraits_geo |>
     select("longitude (deg)", "latitude (deg)") |>
@@ -151,6 +185,8 @@ if (!file.exists(output)) {
     rename(decimal_longitude = `longitude (deg)`, decimal_latitude = `latitude (deg)`, annual_precipitation = wc2.1_30s_bio_12, average_temperature = wc2.1_30s_bio_1) |>
     select(decimal_longitude, decimal_latitude, annual_precipitation, average_temperature, everything())
 
+  # --- Step 8: Join species life-history (annual/perennial) from Wenk_2023 ---
+  # Concatenates multiple recorded values per species into a single string.
   species_life_history <-
   austraits_unflattened |>
   austraits::extract_dataset("Wenk_2023") |>
@@ -162,6 +198,10 @@ if (!file.exists(output)) {
   ungroup() |>
   distinct()
   
+  # --- Step 9: Join species growth form from Wenk_2022 and simplify categories ---
+  # Derives two new columns:
+  #   woody        : broad binary split (woody vs. non-woody)
+  #   growth_form_simpler : collapsed into 6 coarse categories
   species_growth_form <-
   austraits_unflattened |>
   austraits::extract_dataset("Wenk_2022") |>
@@ -171,9 +211,9 @@ if (!file.exists(output)) {
   distinct()|>
     mutate(
       woody = ifelse(
-        !str_detect(growth_form, "herb|fern|tussock|geophyte|lycophyte|basal_large|graminoid"), "woody", "non-woody"
+        !str_detect(growth_form, "herb|fern|tussock|geophyte|lycophyte|basal_large|graminoid|hummock"), "woody", "non-woody"
       ),
-      # case_when doesn't overwrite if a condition is met multiple times, so these are ordered these in order of preference
+      # case_when doesn't overwrite if a condition is met multiple times, so these are ordered in order of preference
       growth_form_simpler = case_when(
         str_detect(growth_form, "climber") ~ "climber",
         str_detect(growth_form, "tree|mallee|palmoid") ~ "tree",
@@ -186,11 +226,27 @@ if (!file.exists(output)) {
     select(-growth_form) |>
   distinct()
   
-
-  data_traits_climate |>
+  # --- Step 10: Attach life-history and growth-form, then write final dataset ---
+  # Saves the complete dataset as a Parquet file for efficient downstream use.
+  data_traits_climate <- data_traits_climate |>
     left_join(by = "taxon_name", species_life_history) |>
-    left_join(by = "taxon_name", species_growth_form) |>
+    left_join(by = "taxon_name", species_growth_form)
+    
+  data_traits_climate_woody_NA <- data_traits_climate |> 
+    filter(is.na(woody))
+  write_csv(data_traits_climate_woody_NA, "data/leaf_compound_filter/data_traits_climate_woody_NA.csv")
+  
+  data_traits_climate |>
     arrow::write_parquet("data-processed/data_traits_climate.parquet")
 }
 
 ```
+
+
+```{r}
+  data_traits_climate |>
+    left_join(by = "taxon_name", species_life_history) |>
+    left_join(by = "taxon_name", species_growth_form) |> 
+    distinct(taxon_name)
+
+    ```

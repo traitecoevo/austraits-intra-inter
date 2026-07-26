@@ -1,5 +1,6 @@
-fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitation") {
+fit_model2d_4panel <- function(data_model,ind_variable = "log_annual_precipitation") {
   
+  browser()
   
   if(str_detect(ind_variable,"log")){f = exp}else{f = I}
   if(str_detect(ind_variable,"log")){standard_name = str_remove(ind_variable, "log_")}else{standard_name = ind_variable}
@@ -14,6 +15,12 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
     environment_label = "MAP (mm)"
   } else{
     environment_label = expression(paste(MAT, " (",degree*C,")"))
+  }
+  
+  if(ind_variable == "log_annual_precipitation"){
+    b1_label = expression(paste(B["1[Prec,i]"]))
+  } else{
+    b1_label = expression(paste(B["1[Temp,i]"]))
   }
   
   trait_name <- data_model$trait_name[1]
@@ -98,7 +105,7 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
     mutate(taxon_name = "global")
   
   data_c_line %>%
-    mutate(value = as.numeric(exp(fixef(fit2)$cond[1] + fixef(fit2)$cond[2]*data_c_line[,"annual_precipitation_mn"] +  fixef(fit2)$cond[3]*data_c_line[,"annual_precipitation_c"] + fixef(fit2)$cond[4]*data_c_line[,"average_temperature_mn"] + fixef(fit2)$cond[5]*data_c_line[,"average_temperature_c"])[1:2,1])) -> data_c_line
+    mutate(value = as.numeric(exp(fixef(fit2)$cond[1] + fixef(fit2)$cond[2]*data_c_line[,"log_annual_precipitation_mn"] +  fixef(fit2)$cond[3]*data_c_line[,"log_annual_precipitation_c"] + fixef(fit2)$cond[4]*data_c_line[,"average_temperature_mn"] + fixef(fit2)$cond[5]*data_c_line[,"average_temperature_c"])[1:2,1])) -> data_c_line
   
   # combine
   data_fit2 <-
@@ -157,7 +164,6 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
   data_c_line$re_strength <- as.numeric(fixef(fit2)$cond[paste0(standard_name,"_c")])
   data_c_line |>
     mutate(!!paste0(standard_name, "_c_plot") := f(get(paste0(standard_name, "_c_plot")))) -> data_c_line
-  browser()
   b <-
   data_fit2 |>
     left_join(re_strength) %>%
@@ -211,6 +217,20 @@ fit_model2d_3panel <- function(data_model,ind_variable = "log_annual_precipitati
     theme(legend.position = "none",
           text = element_text(size = 12),
           axis.text = element_text(size = 12)) 
+  d <-
+    re_strength |>
+    ggplot(aes(x = re_strength)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    # geom_line() +
+    # raw data
+    geom_density(linewidth = 1.5) +
+    theme_classic() +
+    theme(legend.position = "none") +
+    labs(x = b1_label, y= "Density") +
+    theme(legend.position = "none",
+          text = element_text(size = 12),
+          axis.text = element_text(size = 12))
+  
   browser()
-  return(a + b + c)
+  return((a + c + b + d) + plot_layout(nrow = 1))
 }
