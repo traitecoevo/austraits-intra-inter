@@ -19,7 +19,7 @@ Analysis code using trait data from AusTraits and climate data from WorldClim.
 | **WorldClim 2.1 bioclimatic variables, 30 arc-second** (Fick & Hijmans 2017). Download `wc2.1_30s_bio.zip` from <https://www.worldclim.org/data/worldclim21.html> ([direct link](https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_30s_bio.zip)) and unzip it. | `Dataset_construction.qmd` (BIO1, BIO12); `Analysis.qmd` (BIO1, BIO5, BIO10, BIO12) | `data/wc2.1_30s_bio/wc2.1_30s_bio_<n>.tif` |
 | **AusTraits v7.0.0** (Falster et al. 2021, <https://doi.org/10.5281/zenodo.3568417>). Download the release's `.rds` file from Zenodo, or run `austraits::load_austraits(version = "7.0.0", path = "data")`. | `Dataset_construction.qmd` only | `data/austraits-7.0.0.rds` |
 
-If you only run `Analysis.qmd` (using the committed parquet file), you need only the WorldClim files and are only used to run Figure S1, not for the models, so could be skipped unless Figure S1 is specifically to be rerun
+If you only run `Analysis.qmd` (using the committed parquet file), you need only the WorldClim files and are only used to run Figure S1 and the temperature correlations, not for the models, so could be skipped unless Figure S1 is specifically to be rerun
 
 ## Data committed in `data-processed/`
 
