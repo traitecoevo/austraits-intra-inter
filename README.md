@@ -1,6 +1,6 @@
 # Within- vs among-species trait variation along climate gradients in Australia
 
-Analysis code for Britton & Towers, using trait data from AusTraits and climate data from WorldClim.
+Analysis code using trait data from AusTraits and climate data from WorldClim.
 
 ## Workflow
 
