@@ -2,6 +2,8 @@
 
 Analysis code using trait data from AusTraits and climate data from WorldClim.
 
+Note, runtime is a few hours with a full re-run due to Bayesian models outputs.
+
 ## Workflow
 
 1. **`Dataset_construction.qmd`** builds `data-processed/data_traits_climate.parquet` from AusTraits and WorldClim.
