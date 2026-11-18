@@ -40,6 +40,19 @@ rstan_options(auto_write = TRUE)
 ```
 
 ```{r}
+# Create output folders (outputs/ is gitignored, so they don't exist in a fresh clone)
+for (dir in c("outputs/figures",
+              "outputs/tables",
+              "outputs/model_fits/fit2d_bayesian",
+              "outputs/model_fits/fit2d_bayesian_woody",
+              "outputs/model_fits/fit2d_frequentist",
+              "outputs/model_fits/fit2d_frequentist_woody",
+              "outputs/model_fits/within_share")) {
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+```{r}
 # data-processed/data_traits_climate.parquet becomes available after running Dataset_construction.qmd
 # quarto::quarto_render("Dataset_construction.qmd")
 
@@ -208,9 +221,11 @@ warmest quarter) are extracted at the same coordinates as the trait data and
 correlated against `average_temperature` (BIO1, annual mean temperature) to check
 how well the annual mean represents warm-season temperature across the dataset.
 
+NOTE: To run this chunk, 
+
 ```{r}
 # Australia tif just used to crop extent
-australia <- terra::rast("data/australia.tif")
+australia <- terra::rast("data-processed/australia.tif")
 
 bio5_bio10_rasters <-
   file.path("data/wc2.1_30s_bio", c("wc2.1_30s_bio_5.tif", "wc2.1_30s_bio_10.tif","wc2.1_30s_bio_12.tif")) |>
@@ -419,9 +434,6 @@ export_overall_table_figure3(data_traits_climate, "outputs/tables/TableS3.docx")
 export_overall_table_figure4(data_traits_climate, "outputs/tables/TableS8.docx")
 ```
 
-```{r}
-#source("R/export_fixed_effects_tables.R"); #export_fixed_effects_tables_all_traits(data_traits_climate)
-```
 
 # Plot combined distribution of responses, MAP
 
@@ -503,6 +515,11 @@ source("R/build_compressed_trait_figure.R")
 build_compressed_trait_figure(data_traits_climate, "outputs/figures/Figure3.png")
 ```
 
+```{r}
+source("R/export_fixed_effects_tables.R"); export_fixed_effects_tables_all_traits(data_traits_climate, path = "outputs/tables/TableS4.docx")
+```
+
+
 # Figure 4
 
 ```{r}
@@ -562,358 +579,4 @@ ggsave("outputs/figures/FigureS5.png", within_share_curve, height = 14, width = 
 # orthogonality check) and k = 1
 export_within_share_table(traits, k = "observed", "outputs/tables/TableS2.docx")
 export_within_share_table(traits, k = 1, "outputs/tables/TableS7.docx")
-```
-
-```{r}
-# Combined-case metric: (intra slope / inter slope)^2 * (var(deviation from centroid) / var(centroids))
-# Using the all-species model only (combined case), summarised by the posterior median slopes.
-combined_trait_metric <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)
-
-  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      env = "MAP",
-      inter_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_mn"]]),
-      intra_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_c"]]),
-      var_centroids = var(data_model$std_log_annual_precipitation_mn, na.rm = TRUE),
-      var_deviations = var(data_model$std_log_annual_precipitation_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
-
-    tibble(
-      trait = trait,
-      env = "MAT",
-      inter_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_mn"]]),
-      intra_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_c"]]),
-      var_centroids = var(data_model$std_average_temperature_mn, na.rm = TRUE),
-      var_deviations = var(data_model$std_average_temperature_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids))
-  )
-}) |>
-  arrange(env, trait)
-
-combined_trait_metric
-
-combined_trait_metric <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)
-
-  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      env = "MAP",
-      inter_slope = (posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_mn"]]),
-      intra_slope = (posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_c"]]),
-      var_centroids = var(data_model$std_log_annual_precipitation_mn, na.rm = TRUE),
-      var_deviations = var(data_model$std_log_annual_precipitation_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
-
-    tibble(
-      trait = trait,
-      env = "MAT",
-      inter_slope = (posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_mn"]]),
-      intra_slope = (posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_c"]]),
-      var_centroids = var(data_model$std_average_temperature_mn, na.rm = TRUE),
-      var_deviations = var(data_model$std_average_temperature_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids))
-  )
-}) |>
-  arrange(env, trait)
-
-combined_trait_metric %>%
-      ggplot(aes(y = value, x = xpos,
-                 group = interaction(name), colour = "a", fill = "a")) +
-      geom_hline(yintercept = ref_line, linetype = "dashed") +
-      geom_violinhalf(aes(alpha = fill_status), flip = FALSE, width = 0.09,
-                      position = position_nudge(x = 0.08)) +
-      geom_segment(data = data_for_plot_group,
-                   aes(y = low_quantile, yend = upp_quantile, x = xpos),
-                   colour = "black", size = 1.2,
-                   position = position_nudge(x = 0.08)) +
-      geom_point(data = data_for_plot_group, aes(y = mean_value),
-                 colour = "black", position = position_nudge(x = 0.08)) +
-      # Median label placed above the violin half; nudge further than the violin (0.08) to avoid overlap
-      geom_text(data = data_for_plot_group,
-                aes(y = mean_value, label = sprintf("%.2f", mean_value)),
-                colour = "black", size = 3, position = position_nudge(x = 0.17)) +
-      facet_grid(~env) +
-      coord_flip() +
-      theme_bw() +
-      theme(legend.position = "none",
-            text = element_text(size = 12),
-            axis.text = element_text(size = 10.5),
-            axis.text.y = element_blank(),
-            strip.background = element_rect(fill = "white", colour = NA),
-            strip.text = element_text(size = 16)) +
-      scale_x_continuous(limits = c(1.55, 1.85)) +
-          labs(y = y_axis_label) +
-      xlab(trait_label) +
-          scale_y_continuous(limits = c(0, 1)) +
-        scale_alpha_manual(values = c("fill" = 0.5, "no_fill" = 0)) +
-      scale_colour_okabeito(order = c(6), breaks = c("a")) +
-      scale_fill_okabeito(order = c(6),   breaks = c("a")) 
-
-
-```
-
-```{r}
-# Woody/non-woody split metric: (intra slope / inter slope)^2 * (var(deviation from centroid) / var(centroids))
-# Uses the group-specific posterior slopes from the woody interaction model. The all-species metric above is the combined-case analogue.
-woody_split_traits <- setdiff(unique(data_traits_climate$trait_name), c("huber_value", "wood_density"))
-
-woody_split_trait_metric <- map_dfr(woody_split_traits, function(trait) {
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)
-
-  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian_woody/", trait, ".RDS"))
-
-  draw_map <- posterior::as_draws_df(fits[[1]]) |> as_tibble()
-  draw_mat <- posterior::as_draws_df(fits[[2]]) |> as_tibble()
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      group = "non-woody",
-      env = "MAP",
-      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]]),
-      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]]),
-      var_centroids = var((data_model |> filter(woody == "non-woody"))$std_log_annual_precipitation_mn, na.rm = TRUE),
-      var_deviations = var((data_model |> filter(woody == "non-woody"))$std_log_annual_precipitation_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
-
-    tibble(
-      trait = trait,
-      group = "woody",
-      env = "MAP",
-      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]] + draw_map[["b_std_log_annual_precipitation_mn:woodywoody"]]),
-      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]] + draw_map[["b_std_log_annual_precipitation_c:woodywoody"]]),
-      var_centroids = var((data_model |> filter(woody == "woody"))$std_log_annual_precipitation_mn, na.rm = TRUE),
-      var_deviations = var((data_model |> filter(woody == "woody"))$std_log_annual_precipitation_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
-
-    tibble(
-      trait = trait,
-      group = "non-woody",
-      env = "MAT",
-      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]]),
-      intra_slope = median(draw_mat[["b_std_average_temperature_c"]]),
-      var_centroids = var((data_model |> filter(woody == "non-woody"))$std_average_temperature_mn, na.rm = TRUE),
-      var_deviations = var((data_model |> filter(woody == "non-woody"))$std_average_temperature_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
-
-    tibble(
-      trait = trait,
-      group = "woody",
-      env = "MAT",
-      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]] + draw_mat[["b_std_average_temperature_mn:woodywoody"]]),
-      intra_slope = median(draw_mat[["b_std_average_temperature_c"]] + draw_mat[["b_std_average_temperature_c:woodywoody"]]),
-      var_centroids = var((data_model |> filter(woody == "woody"))$std_average_temperature_mn, na.rm = TRUE),
-      var_deviations = var((data_model |> filter(woody == "woody"))$std_average_temperature_c, na.rm = TRUE)
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids))
-  )
-}) |>
-  arrange(env, trait, group)
-
-woody_split_trait_metric %>% 
-select(-inter_slope, -intra_slope)
-```
-
-```{r}
-# Slope-only versions of the same analyses: (intra slope / inter slope)^2
-# No variance terms included.
-combined_trait_slope_metric <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
-  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      env = "MAP",
-      inter_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_mn"]]),
-      intra_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_c"]])
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2),
-
-    tibble(
-      trait = trait,
-      env = "MAT",
-      inter_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_mn"]]),
-      intra_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_c"]])
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2)
-  )
-}) |>
-  arrange(env, trait)
-
-combined_trait_slope_metric
-```
-
-```{r}
-# Slope-only versions of the woody/non-woody split: (intra slope / inter slope)^2
-woody_split_traits <- setdiff(unique(data_traits_climate$trait_name), c("huber_value", "wood_density"))
-
-woody_split_trait_slope_metric <- map_dfr(woody_split_traits, function(trait) {
-  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian_woody/", trait, ".RDS"))
-
-  draw_map <- posterior::as_draws_df(fits[[1]]) |> as_tibble()
-  draw_mat <- posterior::as_draws_df(fits[[2]]) |> as_tibble()
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      group = "non-woody",
-      env = "MAP",
-      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]]),
-      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]])
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2),
-
-    tibble(
-      trait = trait,
-      group = "woody",
-      env = "MAP",
-      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]] + draw_map[["b_std_log_annual_precipitation_mn:woodywoody"]]),
-      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]] + draw_map[["b_std_log_annual_precipitation_c:woodywoody"]])
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2),
-
-    tibble(
-      trait = trait,
-      group = "non-woody",
-      env = "MAT",
-      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]]),
-      intra_slope = median(draw_mat[["b_std_average_temperature_c"]])
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2),
-
-    tibble(
-      trait = trait,
-      group = "woody",
-      env = "MAT",
-      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]] + draw_mat[["b_std_average_temperature_mn:woodywoody"]]),
-      intra_slope = median(draw_mat[["b_std_average_temperature_c"]] + draw_mat[["b_std_average_temperature_c:woodywoody"]])
-    ) |>
-      mutate(metric = (intra_slope / inter_slope)^2)
-  )
-}) |>
-  arrange(env, trait, group)
-
-woody_split_trait_slope_metric
-```
-
-```{r}
-# Figure 5-like plot of the metric components:
-# posterior distributions for inter- and intraspecific slopes, with the variance
-# component shown as a point estimate rather than a posterior distribution.
-trait_order <- c(
-  "leaf_N_per_area",
-  "leaf_delta13C",
-  "leaf_mass_per_area",
-  "seed_dry_mass",
-  "leaf_area",
-  "wood_density",
-  "huber_value"
-)
-
-combined_metric_slope_draws <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
-  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
-
-  draw_map <- posterior::as_draws_df(fits[[1]]) |> as_tibble()
-  draw_mat <- posterior::as_draws_df(fits[[2]]) |> as_tibble()
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      env = "MAP",
-      term = "inter",
-      value = draw_map[["b_std_log_annual_precipitation_mn"]]
-    ),
-    tibble(
-      trait = trait,
-      env = "MAP",
-      term = "intra",
-      value = draw_map[["b_std_log_annual_precipitation_c"]]
-    ),
-    tibble(
-      trait = trait,
-      env = "MAT",
-      term = "inter",
-      value = draw_mat[["b_std_average_temperature_mn"]]
-    ),
-    tibble(
-      trait = trait,
-      env = "MAT",
-      term = "intra",
-      value = draw_mat[["b_std_average_temperature_c"]]
-    )
-  )
-}) |>
-  mutate(trait = factor(trait, levels = trait_order))
-
-combined_metric_var_est <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)
-
-  bind_rows(
-    tibble(
-      trait = trait,
-      env = "MAP",
-      term = "variance",
-      value = var(data_model$std_log_annual_precipitation_c, na.rm = TRUE) /
-        var(data_model$std_log_annual_precipitation_mn, na.rm = TRUE)
-    ),
-    tibble(
-      trait = trait,
-      env = "MAT",
-      term = "variance",
-      value = var(data_model$std_average_temperature_c, na.rm = TRUE) /
-        var(data_model$std_average_temperature_mn, na.rm = TRUE)
-    )
-  )
-}) |>
-  mutate(trait = factor(trait, levels = trait_order))
-
-combined_metric_plot <- ggplot() +
-  geom_violin(
-    data = combined_metric_slope_draws,
-    aes(x = trait, y = value, fill = term),
-    trim = FALSE,
-    alpha = 0.7,
-    width = 0.9
-  ) +
-  geom_point(
-    data = combined_metric_var_est,
-    aes(x = trait, y = value, colour = term),
-    size = 2.5,
-    alpha = 0.9
-  ) +
-  facet_grid(term ~ env, scales = "free_y") +
-  coord_flip() +
-  theme_bw() +
-  theme(
-    legend.position = "none",
-    text = element_text(size = 12),
-    axis.text = element_text(size = 10.5),
-    axis.title.x = element_blank(),
-    strip.background = element_rect(fill = "white", colour = NA),
-    strip.text = element_text(size = 12)
-  ) +
-  labs(y = "Value") +
-  xlab("Trait") +
-  scale_fill_okabeito(order = c(1, 2), breaks = c("inter", "intra")) +
-  scale_colour_okabeito(order = c(3), breaks = c("variance"))
-
-combined_metric_plot
 ```

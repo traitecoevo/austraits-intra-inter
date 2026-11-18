@@ -382,3 +382,26 @@ fit_model2d_bayesian_3panel_ratio_only <- function(data_model, ind_variable = "l
   }
 }
 
+
+# Legend strip for the bottom of Figure 5, naming the violin colours used above:
+# combined = "c", woody = "a", non-woody = "b" in scale_*_okabeito(order = c(6, 3, 5)).
+# Swatches match the violins: half-transparent fill with a solid outline.
+# The plot tag is blanked so plot_annotation(tag_levels) doesn't letter the legend.
+build_group_fill_legend <- function() {
+  keys <- tibble(
+    x      = c(0.2, 0.43, 0.63),
+    colour = c("#0072B2", "#D55E00", "#009E73"),
+    label  = c("Combined", "Woody", "Non-woody")
+  )
+  key_width <- 0.04
+
+  ggplot(keys) +
+    geom_rect(aes(xmin = x, xmax = x + key_width, ymin = -0.5, ymax = 0.5, colour = colour, fill = colour),
+              alpha = 0.5, linewidth = 0.5) +
+    geom_text(aes(x = x + key_width + 0.015, y = 0, label = label), hjust = 0, size = 12 / .pt) +
+    scale_colour_identity() +
+    scale_fill_identity() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(-1, 1), expand = FALSE, clip = "off") +
+    theme_void() +
+    theme(plot.tag = element_blank())
+}

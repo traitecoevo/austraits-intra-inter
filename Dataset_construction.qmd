@@ -48,7 +48,7 @@ traits <- c(
   "huber_value","photosynthetic_pathway","leaflet_area","seed_dry_mass"
 )
 
-output <- "data-processed/austraits_geo_climates.parquet"
+output <- "data-processed/data_traits_climate.parquet"
 
 # Only build the dataset if the output file doesn't already exist (cache check)
 if (!file.exists(output)) {
@@ -67,7 +67,7 @@ if (!file.exists(output)) {
   #     * Auld_2000 seed_dry_mass records
   #   - observations that have both latitude and longitude
 
-    austraits_geo <-
+  austraits_geo <-
     austraits |>
     filter(
       trait_name %in% traits,
@@ -117,7 +117,7 @@ if (!file.exists(output)) {
   # Read back the hand-annotated CSV and remove leaf_area records where the
   # dataset measured individual leaves but the species is compound (i.e. the
   # measurement reflects a leaflet, not a whole leaf).
-  datasets_with_leaf_area <- read_csv("data/leaf_compound_filter/datasets_with_leaf_area_edited.csv")
+  datasets_with_leaf_area <- read_csv("data-processed/leaf_compound_filter/datasets_with_leaf_area_edited.csv")
   
   austraits_geo |>
     filter(trait_name %in% c("leaf_area")) |>
@@ -125,6 +125,7 @@ if (!file.exists(output)) {
 
   austraits_geo_leaf_area |>
   left_join(compound_taxa) |>
+  # Will also remove compound species observations when unclear what leaf unit was measured
   filter(!(compound_species == "compound_present" & leaf_unit_measured == "leaf" & compoundness %in% c(NA,"compound"))) |>
   dplyr::select(-compound_species, -leaf_unit_measured, -evidence, -notes, -compoundness) -> austraits_geo_leaf_area_compound_removed
   
@@ -212,15 +213,6 @@ if (!file.exists(output)) {
     mutate(
       woody = ifelse(
         !str_detect(growth_form, "herb|fern|tussock|geophyte|lycophyte|basal_large|graminoid|hummock"), "woody", "non-woody"
-      ),
-      # case_when doesn't overwrite if a condition is met multiple times, so these are ordered in order of preference
-      growth_form_simpler = case_when(
-        str_detect(growth_form, "climber") ~ "climber",
-        str_detect(growth_form, "tree|mallee|palmoid") ~ "tree",
-        str_detect(growth_form, "shrub|subshrub|basal_large") ~ "shrub",
-        str_detect(growth_form, "herb|geophyte") ~ "herb",
-        str_detect(growth_form, "graminoid|hummock|tussock") ~ "graminoid",
-        str_detect(growth_form, "fern|lycophyte") ~ "primitive"
       )
     )|>
     select(-growth_form) |>
@@ -232,21 +224,12 @@ if (!file.exists(output)) {
     left_join(by = "taxon_name", species_life_history) |>
     left_join(by = "taxon_name", species_growth_form)
     
-  data_traits_climate_woody_NA <- data_traits_climate |> 
-    filter(is.na(woody))
-  write_csv(data_traits_climate_woody_NA, "data/leaf_compound_filter/data_traits_climate_woody_NA.csv")
+  # data_traits_climate_woody_NA <- data_traits_climate |> 
+  #   filter(is.na(woody))
+  # write_csv(data_traits_climate_woody_NA, "data/leaf_compound_filter/data_traits_climate_woody_NA.csv")
   
   data_traits_climate |>
     arrow::write_parquet("data-processed/data_traits_climate.parquet")
 }
 
 ```
-
-
-```{r}
-  data_traits_climate |>
-    left_join(by = "taxon_name", species_life_history) |>
-    left_join(by = "taxon_name", species_growth_form) |> 
-    distinct(taxon_name)
-
-    ```

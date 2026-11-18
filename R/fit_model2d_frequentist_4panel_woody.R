@@ -1,3 +1,5 @@
+source("R/species_within_slopes.R")
+source("R/cache_is_stale.R")
 # Produces a 4-panel figure summarising trait responses to a single climate driver,
 # split by woody / non-woody growth form.
 #
@@ -60,9 +62,10 @@ fit_model2d_frequentist_4panel_woody <- function(data_model, ind_variable = "log
   # For huber_value and wood_density the woody Bayesian model did not converge;
   # fall back to the all-species Bayesian model for a single shared Bᵣ.
   # For other traits, Bᵣ is computed separately for woody and non-woody from the
-  # woody Bayesian brms model. Results are cached to disk.
+  # woody Bayesian brms model. Results are cached to disk and recomputed
+  # whenever the source fit is newer than the cache (see cache_is_stale()).
   if (trait_name %in% c("huber_value", "wood_density")) {
-    if (!file.exists(bayes_ratio_path)) {
+    if (cache_is_stale(bayes_ratio_path, paste0("outputs/model_fits/fit2d_bayesian/", trait_name, ".RDS"))) {
       fits_bayes  <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait_name, ".RDS"))
       bayes_coefs <- if (ind_variable == "log_annual_precipitation") fixef(fits_bayes[[1]])[2:3, 1] else fixef(fits_bayes[[2]])[2:3, 1]
       bayes_denom <- abs(bayes_coefs[1]) + abs(bayes_coefs[2])
@@ -75,7 +78,7 @@ fit_model2d_frequentist_4panel_woody <- function(data_model, ind_variable = "log
       bayes_ratio <- readRDS(bayes_ratio_path)
     }
   } else {
-    if (!file.exists(bayes_ratio_path)) {
+    if (cache_is_stale(bayes_ratio_path, paste0("outputs/model_fits/fit2d_bayesian_woody/", trait_name, ".RDS"))) {
       fits_bayes  <- readRDS(paste0("outputs/model_fits/fit2d_bayesian_woody/", trait_name, ".RDS"))
       # Rows 2–3: β_mn and β_c for non-woody; rows 5–6: woody interaction terms
       bayes_coefs <- if (ind_variable == "log_annual_precipitation") fixef(fits_bayes[[1]])[c(2:3, 5:6), 1] else fixef(fits_bayes[[2]])[c(2:3, 5:6), 1]
@@ -280,15 +283,15 @@ fit_model2d_frequentist_4panel_woody <- function(data_model, ind_variable = "log
   if (length(fits) > 2) {
     if (ind_variable == "log_annual_precipitation") {
       fit_overall <- lm(log_value ~ std_log_annual_precipitation * woody, data = data_model, na.action = na.omit)
-      doc <- read_docx()
-      doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
-      print(doc, target = paste0(trait_name, "_MAP_woody_overall.docx"))
+      # doc <- read_docx()
+      # doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
+      # print(doc, target = paste0(trait_name, "_MAP_woody_overall.docx"))
     }
     if (ind_variable == "average_temperature") {
       fit_overall <- lm(log_value ~ std_average_temperature * woody, data = data_model, na.action = na.omit)
-      doc <- read_docx()
-      doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
-      print(doc, target = paste0(trait_name, "_MAT_woody_overall.docx"))
+      # doc <- read_docx()
+      # doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
+      # print(doc, target = paste0(trait_name, "_MAT_woody_overall.docx"))
     }
   } else {
     fit_overall <- lm(log_value ~ (std_log_annual_precipitation + std_average_temperature) * woody, data = data_model, na.action = na.omit)
@@ -300,13 +303,10 @@ fit_model2d_frequentist_4panel_woody <- function(data_model, ind_variable = "log
     as_tibble() |>
     mutate(!!ind_variable := f(get(paste0("std_", ind_variable)) * scale_c + mean_c))
 
-  # Per-species intraspecific slopes (glmmTMB): each species' β_c random effect, plus
-  # the species-specific woody interaction effect (std_X_c:woodywoody random slope).
-  re_strength <- tibble(
-    taxon_name   = rownames(coef(fitmod)$cond$taxon_name),
-    re_strength  = coef(fitmod)$cond$taxon_name[[paste0("std_", ind_variable, "_c")]],
-    woody_effect = coef(fitmod)$cond$taxon_name[[paste0("std_", ind_variable, "_c:woodywoody")]]
-  )
+  # Per-species intraspecific slopes (glmmTMB): non-woody fixed β_c + each species'
+  # random slope, plus the fixed woody interaction (added for woody taxa below).
+  # Built from fixef() + ranef() — see species_within_slopes().
+  re_strength <- species_within_slopes(fitmod, ind_variable)
 
   # Format Bᵣ annotation: woody (orange) above non-woody (green)
   bayes_ratio_pasted <- paste0("Bᵣ = ", unlist(bayes_ratio))

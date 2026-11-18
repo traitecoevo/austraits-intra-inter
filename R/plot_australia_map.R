@@ -38,8 +38,8 @@ plot_australia_map <- function(data,
     drop_na(decimal_longitude, decimal_latitude)
   
   # Define focal traits
-  focal_traits <- c("huber_value", "leaf_area", "leaf_delta13C", 
-                    "leaf_mass_per_area", "leaf_N_per_area", "wood_density","seed_dry_mass")
+  focal_traits <- c("leaf_delta13C", "leaf_N_per_area", "leaf_mass_per_area",
+                    "leaf_area", "huber_value", "wood_density", "seed_dry_mass")
   
   if (facet_by_trait) {
     # Filter to focal traits only
@@ -47,7 +47,6 @@ plot_australia_map <- function(data,
       filter(trait_name %in% focal_traits) |>
       mutate(trait_name = factor(trait_name, levels = focal_traits)) |>
       distinct(trait_name, decimal_longitude, decimal_latitude, woody, .keep_all = FALSE)
-browser()
     # Compute per-trait, per-growth-form observation and taxa counts
     label_data <- data |>
       drop_na(decimal_longitude, decimal_latitude) |>
@@ -81,7 +80,7 @@ browser()
         aes(x = 113, y = y_pos, label = label, colour = woody),
         hjust = 0,
         vjust = 0,
-        size = 3,
+        size = 6,
         fontface = "bold",
         show.legend = FALSE
       ) +
@@ -101,9 +100,9 @@ browser()
         axis.text = element_text(size = 12),
         axis.title = element_text(size = 13),
         plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
-        strip.text = element_text(size = 14, face = "bold"),
-        legend.text = element_text(size = 12),
-        legend.title = element_text(size = 13)
+        strip.text = element_text(size = 17, face = "bold"),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 17)
       )
     
   } else {

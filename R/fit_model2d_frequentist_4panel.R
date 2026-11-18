@@ -261,16 +261,16 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
     if (ind_variable == "log_annual_precipitation") {
       fit_overall <- lm(log_value ~ std_log_annual_precipitation, data = data_model, na.action = na.omit)
       print(summary(fit_overall))
-      doc <- read_docx()
-      doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
-      print(doc, target = paste0(trait_name, "_MAP_overall.docx"))
+      # doc <- read_docx()
+      # doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
+      # print(doc, target = paste0(trait_name, "_MAP_overall.docx"))
     }
     if (ind_variable == "average_temperature") {
       fit_overall <- lm(log_value ~ std_average_temperature, data = data_model, na.action = na.omit)
       print(summary(fit_overall))
-      doc <- read_docx()
-      doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
-      print(doc, target = paste0(trait_name, "_MAT_overall.docx"))
+      # doc <- read_docx()
+      # doc <- body_add_table(doc, value = as.data.frame(summary(fit_overall)$coef), style = "table_template")
+      # print(doc, target = paste0(trait_name, "_MAT_overall.docx"))
     }
   } else {
     fit_overall <- lm(log_value ~ std_log_annual_precipitation + std_average_temperature, data = data_model, na.action = na.omit)
@@ -387,7 +387,7 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
     if (woody_colouring) {
       c <- data_fit2 |>
         ggplot(aes(get(standard_name), exp(log_value))) +
-        geom_point(alpha = 0.5, col = "grey", data = data_model) +
+        geom_point(alpha = 0.75, col = "grey", data = data_model) +
         geom_point(data = data_fit2 %>% distinct(taxon_name, .keep_all = TRUE),
                    aes(x = get(standard_name), y = exp(log_value), colour = trait_name), alpha = 0.75) +
         geom_line(data = data_fit2_global, col = "black",   linewidth = 1.5 * 1.5) +
@@ -399,7 +399,7 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
     } else {
       c <- data_fit2 |>
         ggplot(aes(get(standard_name), exp(log_value))) +
-        geom_point(alpha = 0.5, col = "grey", data = data_model) +
+        geom_point(alpha = 0.75, col = "grey", data = data_model) +
         geom_point(data = data_fit2 %>% distinct(taxon_name, .keep_all = TRUE),
                    aes(x = get(standard_name), y = exp(log_value)), alpha = 0.75, col = "#E69F00") +
         geom_line(data = data_fit2_re_overall, aes(x = as.numeric(get(ind_variable)), y = exp(Predicted)), linewidth = 1.5, colour = "black") +
@@ -413,7 +413,7 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
   } else {
     c <- data_fit2 |>
       ggplot(aes(get(standard_name), log_value)) +
-      geom_point(alpha = 0.5, col = "grey", data = data_model) +
+      geom_point(alpha = 0.75, col = "grey", data = data_model) +
       geom_point(data = data_fit2 %>% distinct(taxon_name, .keep_all = TRUE),
                  aes(x = get(standard_name), y = log_value), alpha = 0.75, col = "#E69F00") +
       geom_line(data = data_fit2_re_overall, aes(x = as.numeric(get(ind_variable)), y = Predicted), linewidth = 1.5, colour = "black") +
@@ -427,6 +427,7 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
 
   # ---- Panel d: density of per-species intraspecific slopes ----
   # Vertical lines: grey = OLS overall slope; yellow/orange = fixed β_c (intraspecific effect)
+  # Titled with the trait label so the panel is identifiable on its own (e.g. Figure 3 histograms)
   if (woody_colouring) {
     d <- re_strength |>
       ggplot(aes(x = re_strength)) +
@@ -434,8 +435,9 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
       geom_density(linewidth = 1.5, colour = "#D55E00", fill = "#D55E00", alpha = 0.1) +
       scale_x_continuous(limits = c(-max(abs(re_strength$re_strength)), max(abs(re_strength$re_strength)))) +
       theme_classic() +
-      labs(x = b1_label, y = "Density") +
-      theme(legend.position = "none", text = element_text(size = 12), axis.text = element_text(size = 12), axis.title = element_text(size = 13))
+      labs(x = b1_label, y = "Density", title = trait_label) +
+      theme(legend.position = "none", text = element_text(size = 12), axis.text = element_text(size = 12), axis.title = element_text(size = 13),
+            plot.title = element_text(hjust = 0.5))
   } else {
     d <- ggplot() +
       geom_vline(xintercept = 0, linetype = "dashed") +
@@ -450,9 +452,9 @@ fit_model2d_frequentist_4panel <- function(data_model, ind_variable = "log_annua
       ) +
       scale_x_continuous(limits = c(-max(abs(re_strength$re_strength)) * 1.1, max(abs(re_strength$re_strength)) * 1.1)) +
       theme_classic() +
-      labs(x = b1_label, y = "Density") +
-      theme(legend.position = "none", text = element_text(size = 12), axis.text = element_text(size = 12), axis.title = element_text(size = 13))
+      labs(x = b1_label, y = "Density", title = trait_label) +
+      theme(legend.position = "none", text = element_text(size = 12), axis.text = element_text(size = 12), axis.title = element_text(size = 13),
+            plot.title = element_text(hjust = 0.5))
   }
-
   return(list(a, c + b + d + plot_layout(nrow = 1)))
 }

@@ -1,3 +1,5 @@
+source("R/prepare_model_data.R")
+
 fit_model2d_frequentist <- function(data_model) {
   if(data_model$trait_name[1] %in% c()){
   fit_lme <- glmmTMB(log_value ~ (std_log_annual_precipitation_mn + std_log_annual_precipitation_c + std_average_temperature_mn + std_average_temperature_c) + (1 | taxon_name) +  (0 + std_log_annual_precipitation_c | taxon_name)+ (0 +std_average_temperature_c | taxon_name), data = data_model)
@@ -40,4 +42,12 @@ fit_model2d_frequentist <- function(data_model) {
   }
 
   saveRDS(list_to_save,paste0("outputs/model_fits/fit2d_frequentist/",data_model$trait_name[1],".RDS"))
+}
+
+# Fits fit_model2d_frequentist() for every trait present in data.
+fit_model2d_frequentist_all_traits <- function(data) {
+  for (trait in unique(data$trait_name)) {
+    cat(trait, ":  ")
+    fit_model2d_frequentist(prepare_model_data(data, trait))
+  }
 }

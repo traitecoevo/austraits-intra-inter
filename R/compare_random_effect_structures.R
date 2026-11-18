@@ -10,7 +10,6 @@ source("R/prepare_model_data.R")
 #   both_grp   intercept SD and slope SD each estimated separately per growth form
 #
 # AIC: glmmTMB fits of all three structures (fast).
-# LOO: brms fits of pooled vs both_grp (PSIS-LOO; slow, so results are cached).
 #
 # Env_m = std_<var>_mn, Env_w = std_<var>_c. Per-group SDs are independent between
 # growth forms (each taxon belongs to one growth form, so no correlation is estimable):
@@ -53,57 +52,6 @@ compare_re_aic <- function(data, traits) {
     group_by(trait, env) |>
     mutate(dAIC = AIC - min(AIC)) |>
     ungroup()
-}
-
-# LOO for one trait x climate variable x structure (brms), cached so the slow fits
-# only run once. Only the loo object and a few diagnostics are kept, not the fit.
-re_compare_loo_one <- function(data, trait, env, structure, iter = 4000,
-                               cache_dir = "outputs/model_fits/re_structure_loo") {
-  cache_path <- file.path(cache_dir, paste0(trait, "_", env, "_", structure, ".RDS"))
-  if (file.exists(cache_path)) return(readRDS(cache_path))
-
-  d <- prepare_model_data(data, trait) |> mutate(taxon_slope = taxon_name)
-  fit <- brms::brm(re_compare_formula(RE_COMPARE_ENV_VARS[[env]], structure, "brms"),
-                   data = d, chains = 4, iter = iter, cores = 4,
-                   control = list(adapt_delta = 0.98), seed = 1, refresh = 0)
-  np <- brms::nuts_params(fit)
-  out <- list(
-    loo = brms::loo(fit),
-    diagnostics = tibble(trait = trait, env = env, structure = structure,
-                         max_rhat = max(brms::rhat(fit), na.rm = TRUE),
-                         divergences = sum(np$Value[np$Parameter == "divergent__"]))
-  )
-  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
-  saveRDS(out, cache_path)
-  rm(fit); gc(verbose = FALSE)
-  out
-}
-
-# LOO comparison of pooled vs both_grp for each trait x climate variable: elpd of each,
-# the difference (both_grp - pooled, positive = by-group better) with its SE, Pareto-k
-# diagnostics and sampler diagnostics.
-compare_re_loo <- function(data, traits, structures = c("pooled", "both_grp"), iter = 4000) {
-  tidyr::expand_grid(trait = traits, env = names(RE_COMPARE_ENV_VARS)) |>
-    purrr::pmap_dfr(function(trait, env) {
-      res <- purrr::map(structures, \(s) re_compare_loo_one(data, trait, env, s, iter = iter))
-      names(res) <- structures
-      comp <- brms::loo_compare(res[[1]]$loo, res[[2]]$loo)
-      # loo_compare rows are ordered best first; elpd_diff is relative to the best model
-      diff <- comp[, "elpd_diff"]; se <- comp[, "se_diff"]
-      second <- rownames(comp)[2]
-      sign <- if (second == "model1") 1 else -1   # +: structures[2] better than structures[1]
-      tibble(
-        trait = trait, env = env,
-        elpd_pooled   = res[[1]]$loo$estimates["elpd_loo", "Estimate"],
-        elpd_both_grp = res[[2]]$loo$estimates["elpd_loo", "Estimate"],
-        elpd_diff     = sign * abs(diff[2]),
-        se_diff       = se[2],
-        high_k_pooled   = sum(res[[1]]$loo$diagnostics$pareto_k > 0.7),
-        high_k_both_grp = sum(res[[2]]$loo$diagnostics$pareto_k > 0.7),
-        max_rhat      = max(res[[1]]$diagnostics$max_rhat, res[[2]]$diagnostics$max_rhat),
-        divergences   = res[[1]]$diagnostics$divergences + res[[2]]$diagnostics$divergences
-      )
-    })
 }
 
 # Word table (flextable, same layout as the other tables) of compare_re_aic() output:
