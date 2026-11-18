@@ -5,11 +5,39 @@ editor_options:
   chunk_output_type: console
 ---
 
-## Setup 
+## Data requirements
+
+`data/` is not committed (it is gitignored because of its size). Before running this
+document, download the following into `data/`:
+
+1. **WorldClim 2.1 bioclimatic variables, 30 arc-second resolution** (Fick & Hijmans 2017).
+   Download `wc2.1_30s_bio.zip` from <https://www.worldclim.org/data/worldclim21.html>
+   (direct link: <https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_30s_bio.zip>)
+   and unzip it into `data/wc2.1_30s_bio/`. This document uses BIO1 and BIO12;
+   `Analysis.qmd` also uses BIO5 and BIO10.
+2. **AusTraits v7.0.0** (Falster et al. 2021, <https://doi.org/10.5281/zenodo.3568417>).
+   Save the release's `.rds` file as `data/austraits-7.0.0.rds`, either by downloading it
+   from Zenodo or with `austraits::load_austraits(version = "7.0.0", path = "data")`.
+
+Files already committed in `data-processed/` and used here:
+
+- `australia.tif`: Australia mask used to crop the climate rasters.
+- `datasets_with_leaf_area_edited.csv`: hand-annotated compound-leaf filter (Step 5).
+- `data_traits_climate.parquet`: the output of this document. The dataset is only
+  rebuilt if this file is absent, so delete it to rebuild from AusTraits.
+
+## Setup
 
 ```{r}
 library(tidyverse)
 library(terra) # used to extract and process rasters
+```
+
+```{r}
+# Create folders this document writes to (data/ is gitignored, so they don't exist in a fresh clone)
+for (dir in c("data/leaf_compound_filter", "data-processed")) {
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+}
 ```
 
 
@@ -28,7 +56,7 @@ Load climate covariates from worldclim
 vars <- c("wc2.1_30s_bio_1.tif", "wc2.1_30s_bio_12.tif")
 
 # Load the Australia boundary raster (used as a crop mask)
-australia <- terra::rast("data/australia.tif")
+australia <- terra::rast("data-processed/australia.tif")
 
 # Load both climate rasters, stack them, and crop to the Australian extent
 stacked_rasters <-
@@ -117,7 +145,7 @@ if (!file.exists(output)) {
   # Read back the hand-annotated CSV and remove leaf_area records where the
   # dataset measured individual leaves but the species is compound (i.e. the
   # measurement reflects a leaflet, not a whole leaf).
-  datasets_with_leaf_area <- read_csv("data-processed/leaf_compound_filter/datasets_with_leaf_area_edited.csv")
+  datasets_with_leaf_area <- read_csv("data-processed/datasets_with_leaf_area_edited.csv")
   
   austraits_geo |>
     filter(trait_name %in% c("leaf_area")) |>
