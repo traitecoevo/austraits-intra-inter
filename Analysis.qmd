@@ -4,17 +4,11 @@ editor_options:
   chunk_output_type: console
 ---
 
-# Background & aims
-
-1.  
-
 ## Literature
 
 - Cornwell & Ackerly 2009
 - Ogle 2014 - wood density
 - Fischer et al 2025 (in review) - Global Wood Density Database. partition variance at different levels of biological organisation and with and quantify correlations with climate variables. They fit exactly the same structure for the mixed effect model that I ended up using, including the two climate variables, the average species value and the centered deviation from the average. Reassuring that they converged on the same approach. They cite an Gelman reference (guru statistician) where they recommend this approach for LMMs when "Predictors and Group Effects Correlate"  https://doi.org/10.2139/ssrn.1010095
-
-
 
 # Setup
 
@@ -37,6 +31,8 @@ library(rnaturalearthdata)
 library(ggtext)
 library(brms)
 library(collapse)
+library(terra)
+library(tidyterra)
 ```
 
 ```{r}
@@ -44,11 +40,23 @@ rstan_options(auto_write = TRUE)
 ```
 
 ```{r}
+# data-processed/data_traits_climate.parquet becomes available after running Dataset_construction.qmd
+# quarto::quarto_render("Dataset_construction.qmd")
+
 data_traits_climate_raw <-
   arrow::read_parquet("data-processed/data_traits_climate.parquet")
 ```
 
 ```{r}
+# Remove higher taxonomic rank than species
+data_traits_climate_raw <- data_traits_climate_raw %>%
+filter(taxon_rank %in% c("species", "subspecies", "variety"))
+```
+
+# Data preparation
+
+```{r}
+# See overall amount of taxa in dataset
 data_traits_climate_raw |>
   pull(taxon_name) |>
   unique() |> 
@@ -77,32 +85,31 @@ data_traits_climate <-  data_traits_climate_raw |>
   # Step 2: convert Δ to ci/ca ratio (proxy for intrinsic WUE)
   #   ci/ca = (Δ - a) / (b - a)  where a = 4.4‰ (diffusion), b = 27‰ (carboxylation)
   #   Higher ci/ca → lower WUE
+  # Also, just convert huber value to more readable units (mm2/cm2)
   mutate(value = ifelse(trait_name == "huber_value",value*1e2, value)) |>
   mutate(value = ifelse(trait_name == "leaf_delta13C",(value - 4.4)/(27-4.4), value)) |>
-  drop_na(value) |>
+  # remove trait, climate, woody rows with NA data
+  drop_na(value, annual_precipitation, average_temperature, woody) |>
   # NOTE: range-based select relies on column ordering from the parquet file;
   # 'cell' must fall between decimal_longitude and life_stage for ncell to work below
-  select(decimal_longitude:life_stage, woody)
-  
-data_traits_climate <- data_traits_climate |>
+  select(decimal_longitude:life_stage, woody) |>
+  # log transform precipitation
   mutate(
     log_annual_precipitation = log(annual_precipitation),
     # leaf_delta13C is already on a bounded (0-1) ci/ca scale; log-transform all other traits
     log_value = ifelse(trait_name == "leaf_delta13C", value, log(value))
   ) |>
-  # Count how many unique climate cells each species appears in (across ALL traits)
+  # Count how many unique climate cells each species appears per trait
   group_by(taxon_name, trait_name) |>
   mutate(ncell = length(unique((cell)))) |> 
   ungroup() |>
   # Require species to appear in at least 2 climate cells (needed to estimate intraspecific variation)
     filter(ncell > 1) |>
-  # 3 required for convergence in huber value
-    # filter(!(trait_name == "huber_value" & ncell < 3)) |>
-  # Remove pteridophytes / lycophytes (too few observations for reliable estimates)
   # huber_value and wood_density are only meaningful for woody species
   filter(!(trait_name %in% c("wood_density", "huber_value") & woody != "woody"))
 ```
 
+# Mean taxon-trait value per cell
 
 ```{r}
 data_traits_climate <- data_traits_climate %>%
@@ -121,17 +128,19 @@ data_traits_climate <- data_traits_climate %>%
   decimal_latitude = decimal_latitude[1])
 ```
 
+
+# ED Figure 1 - Map of Australia with traits
 ```{r}
 source("R/plot_australia_map.R")
 
 plot_australia_map(data_traits_climate)
-ggsave("australia_map.png", height = 13.33, width = 18)
-
+ggsave("outputs/figures/EDFig1.png", height = 13.33, width = 18)
 ```
 
+# Data preparation - climate centroids and deviation
 
 ```{r}
-# --- Step B: Compute global scaling parameters for climate variables ---
+# --- Compute global scaling parameters for climate variables ---
 # distinct(cell) ensures each climate cell is weighted equally regardless of how
 # many species observations it has (otherwise high-diversity cells would dominate).
 # These scalers are applied to all traits combined (union of all cells, not per-trait).
@@ -192,662 +201,719 @@ data_traits_climate |>
     std_average_temperature_c = std_average_temperature - std_average_temperature_mn) -> data_traits_climate
 ```  
 
+# Climate variable check: BIO5 & BIO10 vs average temperature
+
+BIO5 (max temperature of the warmest month) and BIO10 (mean temperature of the
+warmest quarter) are extracted at the same coordinates as the trait data and
+correlated against `average_temperature` (BIO1, annual mean temperature) to check
+how well the annual mean represents warm-season temperature across the dataset.
+
 ```{r}
-#print various statistics
-data_traits_climate %>%
-  pull(taxon_name) %>%
-  unique() %>%
-  length()
+# Australia tif just used to crop extent
+australia <- terra::rast("data/australia.tif")
 
-data_traits_climate %>%
-  group_by(trait_name) %>%
-  summarise(n_taxon = length(unique(taxon_name)))
+bio5_bio10_rasters <-
+  file.path("data/wc2.1_30s_bio", c("wc2.1_30s_bio_5.tif", "wc2.1_30s_bio_10.tif","wc2.1_30s_bio_12.tif")) |>
+  terra::rast() |>
+  terra::crop(australia)
 
-data_traits_climate %>% group_by(trait_name) %>%
-nest() %>%
-mutate(min = map_dbl(data, ~min(.x$value)),
-max = map_dbl(data, ~max(.x$value))) %>% pull(min) -> min
+# One extraction per unique location actually present in the trait data (not per
+# observation), then join back on to avoid redundant raster lookups
+trait_coords <- data_traits_climate |>
+  distinct(decimal_longitude, decimal_latitude, average_temperature)
 
-data_traits_climate %>% group_by(trait_name) %>%
-nest() %>%
-mutate(min = map_dbl(data, ~min(.x$value)),
-max = map_dbl(data, ~max(.x$value))) %>% pull(max) -> max
+trait_coords_vect <- terra::vect(
+  trait_coords,
+  geom = c("decimal_longitude", "decimal_latitude"),
+  crs = terra::crs(bio5_bio10_rasters)
+)
 
-max/min
-
-data_traits_climate %>%
-ungroup %>%
-summarise(min_prec = min(annual_precipitation, na.rm = T),
-max_prec = max(annual_precipitation, na.rm = T),
-min_temp = min(average_temperature, na.rm = T),
-max_temp = max(average_temperature, na.rm = T))
+bio5_bio10_values <-
+  terra::extract(bio5_bio10_rasters, trait_coords_vect, ID = FALSE) |>
+  as_tibble() |>
+  rename(bio5_max_temp_warmest_month = wc2.1_30s_bio_5,
+         bio10_mean_temp_warmest_quarter = wc2.1_30s_bio_10,
+         bio12_mean_annual_precipitation = wc2.1_30s_bio_12) |>
+  bind_cols(trait_coords)
 ```
 
+```{r}
+cor.test(bio5_bio10_values$average_temperature, bio5_bio10_values$bio5_max_temp_warmest_month)
+cor.test(bio5_bio10_values$average_temperature, bio5_bio10_values$bio10_mean_temp_warmest_quarter)
+```
 
 ```{r}
-#Combined
+# Background: climate at the centre of every land cell of the Australia mask
+# (0.05 deg, ~278k cells), i.e. the full Australian climate space, not just trait locations
+bio1_bio5_bio10_rasters <-
+  file.path("data/wc2.1_30s_bio", c("wc2.1_30s_bio_1.tif", "wc2.1_30s_bio_5.tif", "wc2.1_30s_bio_10.tif","wc2.1_30s_bio_12.tif")) |>
+  terra::rast() |>
+  terra::crop(australia)
 
-traits <- unique(data_traits_climate$trait_name)
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait) |>
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,log_annual_precipitation_mn, log_annual_precipitation_c, average_temperature_mn, average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  find_ITV(data_model)
-  }
+australia_climate <-
+  terra::extract(
+    bio1_bio5_bio10_rasters,
+    terra::as.data.frame(australia, xy = TRUE)[, c("x", "y")],
+    ID = FALSE
+  ) |>
+  as_tibble() |>
+  rename(average_temperature = wc2.1_30s_bio_1,
+         bio5_max_temp_warmest_month = wc2.1_30s_bio_5,
+         bio10_mean_temp_warmest_quarter = wc2.1_30s_bio_10,
+         bio12_mean_annual_precipitation = wc2.1_30s_bio_12) |>
+  drop_na()
 
-#Woody
+bind_rows(
+  australia_climate |> mutate(source = "All of Australia"),
+  bio5_bio10_values |> mutate(source = "Trait locations")
+) |>
+  select(source, average_temperature, bio5_max_temp_warmest_month, bio10_mean_temp_warmest_quarter,bio12_mean_annual_precipitation) |>
+  pivot_longer(
+    cols = c(bio5_max_temp_warmest_month, bio10_mean_temp_warmest_quarter,bio12_mean_annual_precipitation),
+    names_to = "bio_var", values_to = "bio_value"
+  ) |>
+  mutate(bio_var = recode(bio_var,
+    bio5_max_temp_warmest_month     = "BIO05: max temp of warmest month",
+    bio10_mean_temp_warmest_quarter = "BIO10: mean temp of warmest quarter",
+    bio12_mean_annual_precipitation = "BIO12: mean annual precipitation"
+  )) |>
+  ggplot(aes(average_temperature, bio_value, colour = source)) +
+  # Background (all of Australia) first so trait locations sit on top
+  geom_hex(data = \(d) filter(d, source == "All of Australia"), size = 0.3, alpha = 0.1) +
+  geom_point(data = \(d) filter(d, source == "Trait locations"), alpha = 0.3) +
+  # Smooths use fixed colours: the all-of-Australia line is darker than its points so it stays visible
+  geom_smooth(data = \(d) filter(d, source == "All of Australia"), method = "lm", colour = "grey20", fill = "grey20") +
+  geom_smooth(data = \(d) filter(d, source == "Trait locations"), method = "lm", colour = "#0072B2", fill = "#0072B2") +
+  facet_wrap(~bio_var, scales = "free_y") +
+  scale_colour_manual(values = c("All of Australia" = "grey60", "Trait locations" = "#0072B2"), name = NULL) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)),
+  fill = "none") +
+  theme_classic() +
+  labs(x = expression(paste("Average temperature, BIO1 (", degree * C, ")")), y = "") +
+  theme(text = element_text(size = 12), axis.text = element_text(size = 12), axis.title = element_text(size = 13),
+        legend.position = "bottom") -> cor_plots
 
-traits <- unique(data_traits_climate$trait_name)
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(woody == "woody") |>
-    filter(trait_name == trait) |>
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,log_annual_precipitation_mn, log_annual_precipitation_c, average_temperature_mn, average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  find_ITV(data_model)
-  }
 
-#Non-woody
+ggplot() +
+  geom_spatraster(data = bio1_bio5_bio10_rasters[[1]]) +
+  labs(title = expression(paste("Average temperature, BIO1 (", degree * C,")"))) -> temp_plot
 
-traits <- unique(data_traits_climate$trait_name)
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(woody == "non-woody") |>
-    filter(trait_name == trait) |>
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,log_annual_precipitation_mn, log_annual_precipitation_c, average_temperature_mn, average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  find_ITV(data_model)
-  }
+ggplot() +
+  geom_spatraster(data = bio1_bio5_bio10_rasters[[4]]) +
+  labs(title = expression(paste("Mean annual precipitation, BIO12 (mm)"))) +
+  scale_fill_continuous(trans = "log") -> prec_plot
+
+cor_plots/(temp_plot|prec_plot)
+ggsave("outputs/figures/FigureS1.png", height = 8, width = 10)
+```
+
+# Data summaries
+
+```{r}
+# Taxa with multiple cells
+data_traits_climate |>
+  pull(taxon_name) |>
+  unique() |>
+  length()
+
+# Taxa per trait with multiple cells
+data_traits_climate |>
+  group_by(trait_name) |>
+  summarise(n_taxon = length(unique(taxon_name)))
+
+# Trait range table: 0.1% and 99.9% quantiles of the cell-mean trait values (robust to a
+# few implausible extreme records) and the fold variation between them. Built from
+# data_traits_climate, which holds exactly the modelled rows (the grey dots in Figure 3).
+# Units as transformed above (huber_value in mm2/cm2, leaf_delta13C as ci/ca).
+source("R/export_trait_range_table.R")
+trait_range_table <- build_trait_range_table(data_traits_climate)
+trait_range_table
+
+export_trait_range_table(trait_range_table, "outputs/tables/TableS1.docx")
+
+data_traits_climate |> 
+  group_by(trait_name) |>
+  nest() %>%
+  ungroup() %>%
+  slice(3) %>%
+  unnest(data) %>%
+  group_by(taxon_name) %>%
+  summarise(value = median(value)) %>%
+  pull(value) %>%
+  hist()
+
+# Minimum and maximum of climate values
+data_traits_climate |>
+  ungroup() |>
+  summarise(min_prec = min(annual_precipitation, na.rm = T),
+  max_prec = max(annual_precipitation, na.rm = T),
+  min_temp = min(average_temperature, na.rm = T),
+  max_temp = max(average_temperature, na.rm = T))
+```
+
+# Fraction of intra-specific variation per trait per growth form
+```{r}
+source("R/summarise_ITV_frac.R")
+itv_summary <- summarise_ITV_frac(data_traits_climate)
+itv_summary
+
+export_ITV_frac_table(itv_summary, "outputs/tables/EDTable1.docx")
 ```
 
 # Fitting Bayesian models of 2d models for relative contribution question
 
 ```{r}
-source("R/fit_model2d_bayesian.R")
-
-traits <- unique(data_traits_climate$trait_name)
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait) |>
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,log_annual_precipitation_mn, log_annual_precipitation_c, average_temperature_mn, average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  fit_model2d_bayesian(data_model)
-  }
+source("R/fit_model2d_bayesian.R"); fit_model2d_bayesian_all_traits(data_traits_climate)
 ```
+
+# Random-effect structure comparison - woody
+
+Before fitting the functional group comparison models: compare random-intercept and random-slope variances
+pooled across growth forms against estimated separately for woody and non-woody taxa
+(fixed effects identical), by AIC from glmmTMB.
 
 ```{r}
-source("R/fit_model2d_bayesian_woody.R")
+source("R/compare_random_effect_structures.R")
+woody_split_traits <- setdiff(unique(data_traits_climate$trait_name), WOODY_ONLY_TRAITS)
 
-traits <- unique(data_traits_climate$trait_name)[1:5]
-traits <- unique(data_traits_climate$trait_name)[2:5]
-traits <- traits[1]
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)  %>% 
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  fit_model2d_bayesian_woody(data_model)
-  }
+re_aic <- compare_re_aic(data_traits_climate, woody_split_traits)
+re_aic |> arrange(trait, env, dAIC)
 
+export_re_aic_table(re_aic, "outputs/tables/TableS6.docx")
 ```
+
+
+# Fitting Bayesian models of 2d models for relative contribution question - functional group
 
 ```{r}
-source("R/fit_model2d_bayesian_woody_seperated.R")
-
-traits <- unique(data_traits_climate$trait_name)[1:5]
-traits <- traits[5]
-
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)  %>% 
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  fit_model2d_bayesian_woody_seperated(data_model)
-  }
-
-sdmass <- readRDS("outputs/model_fits/fit2d_bayesian_woody/seed_dry_mass.RDS")
+# By default the random-intercept SD and the within-species random-slope SD are both
+# estimated separately for woody and non-woody taxa (by_group = TRUE; see
+# R/fit_model2d_bayesian_woody.R and the random-effect structure comparison).
+source("R/fit_model2d_bayesian_woody.R"); fit_model2d_bayesian_woody_all_traits(data_traits_climate)
 ```
-
-
 
 # Fitting Frequentist models of 2d models for plotting and coefficients - all growth forms combined
 
 ```{r}
-source("R/fit_model2d_frequentist.R")
-
-traits <- unique(data_traits_climate$trait_name)
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)  |>
-    select(trait_name, value, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,taxon_name) %>% 
-    drop_na() %>%
-    # mutate(std_log_annual_precipitation_mn = scale(log_annual_precipitation_mn),
-    #        std_log_annual_precipitation_c = scale(log_annual_precipitation_c),
-    #        std_average_temperature_mn = scale(average_temperature_mn),
-    #        std_average_temperature_c = scale(average_temperature_c),
-           mutate(std_log_value = scale(log_value)) 
-  fit_model2d_frequentist(data_model)
-  }
+source("R/fit_model2d_frequentist.R"); fit_model2d_frequentist_all_traits(data_traits_climate)
 ```
 
+# Fitting Frequentist models of 2d models for plotting and coefficients - woody
 
 ```{r}
-traits <- unique(data_traits_climate$trait_name)
-
-# Helper: extract fixed effects from a frequentist glmmTMB model.
-# Returns a tidy tibble with z-statistic and p-value columns.
-extract_freq_fixed <- function(fit, climate_var, trait) {
-  tidy(fit, effects = "fixed") %>%
-    select(term, estimate, std.error, statistic, p.value) %>%
-    mutate(
-      estimate         = round(estimate,  5),
-      std.error        = round(std.error, 5),
-      statistic        = round(statistic, 5),
-      p.value          = round(p.value,   5),
-      climate_variable = climate_var,   # label which climate driver this model used
-      trait            = trait
-    )
-}
-
-# Helper: extract fixed effects from a Bayesian brms model.
-# brms tidy() returns posterior mean/SD + credible interval; no z/p columns.
-extract_bayes_fixed <- function(fit, climate_var, trait) {
-  tidy(fit, effects = "fixed") %>%
-    select(term, estimate, std.error, conf.low, conf.high) %>%
-    mutate(
-      estimate         = round(estimate,  5),
-      std.error        = round(std.error, 5),
-      conf.low         = round(conf.low,  5),
-      conf.high        = round(conf.high, 5),
-      climate_variable = climate_var,
-      trait            = trait
-    )
-}
-
-
-for (trait in traits) {
-
-  # huber_value: frequentist model did not converge reliably; use the Bayesian
-  # (brms) model instead so fixed-effect estimates reflect the full posterior.
-  # All other traits: use the frequentist glmmTMB model.
-  if (trait == "huber_value") {
-
-    model <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
-
-    # Bayesian models are saved as:
-    #   length 3: list(fit_MAP_stan, fit_MAT_stan, data_model)
-    #             model[[1]] = precipitation (MAP), model[[2]] = temperature (MAT)
-    #   length 2: list(fit_stan, data_model) — single combined model
-    if (length(model) == 3) {
-      fixed_tbl <- bind_rows(
-        extract_bayes_fixed(model[[1]], "precipitation", trait),
-        extract_bayes_fixed(model[[2]], "temperature",   trait)
-      )
-    } else if (length(model) == 2) {
-      fixed_tbl <- extract_bayes_fixed(model[[1]], "combined", trait)
-    }
-
-  } else {
-
-    model <- readRDS(paste0("outputs/model_fits/fit2d_frequentist/", trait, ".RDS"))
-
-    # Frequentist models are saved as:
-    #   length 3: list(fit_MAP, fit_MAT, data_model)
-    #             model[[1]] = precipitation (MAP), model[[2]] = temperature (MAT)
-    #   length 2: list(fit_lme, data_model) — single combined model
-    if (length(model) == 3) {
-      fixed_tbl <- bind_rows(
-        extract_freq_fixed(model[[1]], "precipitation", trait),
-        extract_freq_fixed(model[[2]], "temperature",   trait)
-      )
-    } else if (length(model) == 2) {
-      fixed_tbl <- extract_freq_fixed(model[[1]], "combined", trait)
-    }
-
-  }
-
-  doc <- read_docx()
-  doc <- body_add_table(doc, value = fixed_tbl, style = "table_template")
-  print(doc, target = paste0(trait, "_fixed_effects_table.docx"))
-}
+# Matches the Bayesian woody models: by default the random-intercept SD and the
+# within-species random-slope SD are both estimated separately for woody and non-woody
+# taxa (by_group = TRUE; see
+# R/fit_model2d_frequentist_woody.R). Re-run this chunk to refit; it overwrites
+# outputs/model_fits/fit2d_frequentist_woody/, which Figure 4 and the woody tables read
+# from. Use by_group = FALSE for the original model with both SDs pooled.
+source("R/fit_model2d_frequentist_woody.R"); fit_model2d_frequentist_woody_all_traits(data_traits_climate)
 ```
 
+# Export tables - all growth forms combined
 
-# Plot frequentist models of 2d models for plotting and coefficients - all growth forms combined, precipitation
+```{r}
+# Overall (OLS) responses — the grey lines in Figure 3 (all growth forms) and Figure 4 (woody split)
+source("R/export_overall_tables.R")
+export_overall_table_figure3(data_traits_climate, "outputs/tables/TableS3.docx")
+export_overall_table_figure4(data_traits_climate, "outputs/tables/TableS8.docx")
+```
+
+```{r}
+#source("R/export_fixed_effects_tables.R"); #export_fixed_effects_tables_all_traits(data_traits_climate)
+```
+
+# Plot combined distribution of responses, MAP
 
 ```{r}
 source("R/fit_model2d_frequentist_4panel.R")
 
 traits <- unique(data_traits_climate$trait_name)
 
-fit_model2d_frequentist_4panel_out_prec_a <- list()
-fit_model2d_frequentist_4panel_out_prec_b <- list()
-# traits <- traits[5]
+Figure_3_panels <- list()
+
 for (trait in traits) {
   cat(trait, ":  ")
   data_model <- data_traits_climate |>
-    # filter(growth_form_simpler != "primitive") |>
     filter(trait_name == trait)
   fit_model2d_frequentist_4panel_out_prec <- fit_model2d_frequentist_4panel(data_model, ind_variable = "log_annual_precipitation")
-  fit_model2d_frequentist_4panel_out_prec_a[[trait]] <- fit_model2d_frequentist_4panel_out_prec[[1]]
-  fit_model2d_frequentist_4panel_out_prec_b[[trait]] <- fit_model2d_frequentist_4panel_out_prec[[2]]
+  Figure_3_panels[[trait]] <- fit_model2d_frequentist_4panel_out_prec[[2]]
 }
 
-top_row_b <- fit_model2d_frequentist_4panel_out_prec_b[[2]]
-top_row_b[[1]] <- top_row_b[[1]] + labs(title = "Interspecific (turnover component)") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b[[2]] <- top_row_b[[2]] + labs(title = "Intraspecific component") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b[[3]] <- top_row_b[[3]] + labs(title = "Slope of components") + theme(plot.title = element_text(hjust = 0.5))
-patchwork::wrap_plots(list(top_row_b,
-fit_model2d_frequentist_4panel_out_prec_b[[4]],fit_model2d_frequentist_4panel_out_prec_b[[3]],fit_model2d_frequentist_4panel_out_prec_b[[1]],fit_model2d_frequentist_4panel_out_prec_b[[5]],fit_model2d_frequentist_4panel_out_prec_b[[7]],fit_model2d_frequentist_4panel_out_prec_b[[6]]), ncol = 1, guides = "collect", tag = "new") + plot_layout(heights = c(1.1, 1, 1, 1, 1, 1,1)) + plot_annotation(tag_levels = "a")
+# Third column of each trait's row: density of per-species within-species (intraspecific)
+# slopes, titled with its trait label (set in fit_model2d_frequentist_4panel()); give
+# every panel the same x-axis title.
+Figure_3_hist_panels <- imap(Figure_3_panels, ~ {
+  .x[[3]] +
+    labs(x = "Within-species response to MAP") +
+    theme(plot.title = element_text(hjust = 0.5))
+})
 
-ggsave("fit_model2d_4panel_precipitation6_frequentist3.png", height = 18*7/6, width = 13.33)
+patchwork::wrap_plots(list(Figure_3_hist_panels[[2]],
+Figure_3_hist_panels[[4]],
+Figure_3_hist_panels[[3]],
+Figure_3_hist_panels[[1]],
+Figure_3_hist_panels[[5]],
+Figure_3_hist_panels[[7]],
+Figure_3_hist_panels[[6]]), ncol = 3, tag = "new") + plot_annotation(tag_levels = "a")
 
-patchwork::wrap_plots(list(fit_model2d_frequentist_4panel_out_prec_a[[2]],
-fit_model2d_frequentist_4panel_out_prec_a[[4]],fit_model2d_frequentist_4panel_out_prec_a[[3]],fit_model2d_frequentist_4panel_out_prec_a[[1]],fit_model2d_frequentist_4panel_out_prec_a[[6]],fit_model2d_frequentist_4panel_out_prec_a[[5]]), ncol = 3, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
-
-ggsave("fit_model2d_4panel_precipitation6_frequentist_a.png", height = 8, width = 13.33)
+ggsave("outputs/figures/FigureS2.png", height = 8, width = 13.33)
 ```
 
-# Plot frequentist models of 2d models for plotting and coefficients - all growth forms combined, temperature
-
+# Plot Figure 3 - distribution of responses, MAT
 
 ```{r}
-traits <- unique(data_traits_climate$trait_name)
-fit_model2d_frequentist_4panel_out_temp_a <- list()
-fit_model2d_frequentist_4panel_out_temp_b <- list()
+Figure_3_panels <- list()
 
 for (trait in traits) {
   cat(trait, ":  ")
   data_model <- data_traits_climate |>
-    # filter(growth_form_simpler != "primitive") |>
     filter(trait_name == trait)
   fit_model2d_frequentist_4panel_out_temp <- fit_model2d_frequentist_4panel(data_model, ind_variable = "average_temperature")
-  fit_model2d_frequentist_4panel_out_temp_a[[trait]] <- fit_model2d_frequentist_4panel_out_temp[[1]]
-  fit_model2d_frequentist_4panel_out_temp_b[[trait]] <- fit_model2d_frequentist_4panel_out_temp[[2]]
+  Figure_3_panels[[trait]] <- fit_model2d_frequentist_4panel_out_temp[[2]]
 }
 
-top_row_b <- fit_model2d_frequentist_4panel_out_temp_b[[2]]
-top_row_b[[1]] <- top_row_b[[1]] + labs(title = "Interspecific (turnover component)") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b[[2]] <- top_row_b[[2]] + labs(title = "Intraspecific component") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b[[3]] <- top_row_b[[3]] + labs(title = "Slope of components") + theme(plot.title = element_text(hjust = 0.5))
-patchwork::wrap_plots(list(top_row_b,
-fit_model2d_frequentist_4panel_out_temp_b[[4]],fit_model2d_frequentist_4panel_out_temp_b[[3]],fit_model2d_frequentist_4panel_out_temp_b[[1]],fit_model2d_frequentist_4panel_out_temp_b[[5]],fit_model2d_frequentist_4panel_out_temp_b[[7]],fit_model2d_frequentist_4panel_out_temp_b[[6]]), ncol = 1, guides = "collect", tag = "new") + plot_layout(heights = c(1.1, 1, 1, 1, 1, 1,1)) + plot_annotation(tag_levels = "a")
 
-ggsave("fit_model2d_4panel_temperature6_frequentist3.png", height = 18, width = 13.33)
+# Third column of each trait's row: density of per-species within-species (intraspecific)
+# slopes, titled with its trait label (set in fit_model2d_frequentist_4panel()); give
+# every panel the same x-axis title.
+Figure_3_hist_panels <- imap(Figure_3_panels, ~ {
+  .x[[3]] +
+    labs(x = "Within-species response to MAT") +
+    theme(plot.title = element_text(hjust = 0.5))
+})
 
-patchwork::wrap_plots(list(fit_model2d_frequentist_4panel_out_temp_a[[2]],
-fit_model2d_frequentist_4panel_out_temp_a[[4]],fit_model2d_frequentist_4panel_out_temp_a[[3]],fit_model2d_frequentist_4panel_out_temp_a[[1]],fit_model2d_frequentist_4panel_out_temp_a[[6]],fit_model2d_frequentist_4panel_out_temp_a[[5]]), ncol = 3, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
+patchwork::wrap_plots(list(Figure_3_hist_panels[[2]],
+Figure_3_hist_panels[[4]],
+Figure_3_hist_panels[[3]],
+Figure_3_hist_panels[[1]],
+Figure_3_hist_panels[[5]],
+Figure_3_hist_panels[[7]],
+Figure_3_hist_panels[[6]]), ncol = 3, tag = "new") + plot_annotation(tag_levels = "a")
 
-ggsave("fit_model2d_4panel_temperature6_frequentist_a.png", height = 8, width = 13.33)
+ggsave("outputs/figures/FigureS3.png", height = 8, width = 13.33)
 ```
 
-
-# Fitting Frequentist models of 2d models for plotting and coefficients - woody
+# Figure 3
 
 ```{r}
-source("R/fit_model2d_frequentist_woody.R")
+source("R/fit_model2d_frequentist_4panel_compressed.r")
+source("R/build_compressed_trait_figure.R")
 
-traits <- unique(data_traits_climate$trait_name)
-traits <- traits[seq(1:5)]
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)  %>% 
-    select(trait_name, log_value, std_average_temperature, std_log_annual_precipitation, std_log_annual_precipitation_mn, std_log_annual_precipitation_c, std_average_temperature_mn, std_average_temperature_c,taxon_name, woody) %>% 
-    drop_na() %>%
-           mutate(std_log_value = scale(log_value)) 
-  fit_model2d_frequentist_woody(data_model)
-  }
+build_compressed_trait_figure(data_traits_climate, "outputs/figures/Figure3.png")
 ```
 
-```{r}
-# extract_freq_fixed / extract_bayes_fixed helpers are defined in the chunk above
-
-traits <- unique(data_traits_climate$trait_name)
-traits <- traits[seq(1:4)]
-
-for (trait in traits) {
-
-  # huber_value: use the Bayesian woody model for the same reason as above
-  # (frequentist convergence issues); all other traits use the frequentist woody model.
-  if (trait == "huber_value") {
-
-    model <- readRDS(paste0("outputs/model_fits/fit2d_bayesian_woody/", trait, ".RDS"))
-
-    # Bayesian woody models are saved as:
-    #   length 3: list(fit_MAP_stan, fit_MAT_stan, data_model)
-    #             model[[1]] = precipitation (MAP), model[[2]] = temperature (MAT)
-    #   length 2: list(fit_stan, data_model) — single combined model
-    if (length(model) == 3) {
-      fixed_tbl <- bind_rows(
-        extract_bayes_fixed(model[[1]], "precipitation", trait),
-        extract_bayes_fixed(model[[2]], "temperature",   trait)
-      )
-    } else if (length(model) == 2) {
-      fixed_tbl <- extract_bayes_fixed(model[[1]], "combined", trait)
-    }
-
-  } else {
-
-    model <- readRDS(paste0("outputs/model_fits/fit2d_frequentist_woody/", trait, ".RDS"))
-
-    # Frequentist woody models are saved as:
-    #   length 3: list(fit_MAP, fit_MAT, data_model)
-    #             model[[1]] = precipitation (MAP), model[[2]] = temperature (MAT)
-    #   length 2: list(fit_lme, data_model) — single combined model
-    if (length(model) == 3) {
-      fixed_tbl <- bind_rows(
-        extract_freq_fixed(model[[1]], "precipitation", trait),
-        extract_freq_fixed(model[[2]], "temperature",   trait)
-      )
-    } else if (length(model) == 2) {
-      fixed_tbl <- extract_freq_fixed(model[[1]], "combined", trait)
-    }
-
-  }
-
-  doc <- read_docx()
-  doc <- body_add_table(doc, value = fixed_tbl, style = "table_template")
-  print(doc, target = paste0(trait, "_fixed_effects_table_woody.docx"))
-}
-```
+# Figure 4
 
 ```{r}
-# For each frequentist woody fit, test whether each functional group's slope is
-# different from zero (NOT whether woody differs from non-woody).
-#
-# Group-specific slopes:
-#   non-woody = beta_base
-#   woody     = beta_base + beta_interaction
-#
-# Test statistic for woody slope uses Var(beta_base + beta_interaction):
-#   se = sqrt(Var(base) + Var(interaction) + 2*Cov(base, interaction))
+source("R/fit_model2d_frequentist_4panel_woody_compressed.r")
+source("R/build_compressed_trait_figure.R")
 
-woody_fit_files <- list.files(
-  "outputs/model_fits/fit2d_frequentist_woody",
-  pattern = "\\.RDS$",
-  full.names = TRUE
+build_compressed_trait_figure(
+  data_traits_climate,
+  "outputs/figures/Figure4.png",
+  woody = TRUE,
+  # Leaf area moves to the right half (under the legend, above seed mass): 3 rows
+  left_traits = c("leaf_delta13C", "leaf_N_per_area", "leaf_mass_per_area"),
+  height = 11 * (3 / 4) * 1.33,
+  width = 13.33 * (4 / 3) * 1.33
 )
-
-find_interaction_term <- function(term_names, base_term) {
-  cand1 <- paste0(base_term, ":woodywoody")
-  cand2 <- paste0("woodywoody:", base_term)
-  if (cand1 %in% term_names) return(cand1)
-  if (cand2 %in% term_names) return(cand2)
-  NA_character_
-}
-
-test_group_slope_zero <- function(fit, base_term, group_label) {
-  term_names <- names(fixef(fit)$cond)
-  vc <- as.matrix(vcov(fit)$cond)
-
-  if (!(base_term %in% term_names)) {
-    return(tibble(
-      group = group_label,
-      estimate = NA_real_,
-      std.error = NA_real_,
-      z.value = NA_real_,
-      p.value = NA_real_,
-      significant = NA
-    ))
-  }
-
-  base_est <- unname(fixef(fit)$cond[[base_term]])
-
-  if (group_label == "non-woody") {
-    est <- base_est
-    se <- sqrt(vc[base_term, base_term])
-  } else {
-    int_term <- find_interaction_term(term_names, base_term)
-    if (is.na(int_term)) {
-      est <- base_est
-      se <- sqrt(vc[base_term, base_term])
-    } else {
-      int_est <- unname(fixef(fit)$cond[[int_term]])
-      est <- base_est + int_est
-      se <- sqrt(vc[base_term, base_term] + vc[int_term, int_term] + 2 * vc[base_term, int_term])
-    }
-  }
-
-  z <- est / se
-  p <- 2 * pnorm(abs(z), lower.tail = FALSE)
-
-  tibble(
-    group = group_label,
-    estimate = est,
-    std.error = se,
-    z.value = z,
-    p.value = p,
-    significant = p < 0.05
-  )
-}
-
-extract_trait_slope_tests <- function(fit_obj, trait) {
-  # Expected storage from fit_model2d_frequentist_woody():
-  # length 3 -> list(fit_MAP, fit_MAT, data_model)
-  # length 2 -> list(fit_combined, data_model) [legacy/special cases]
-  if (length(fit_obj) == 3) {
-    model_specs <- tribble(
-      ~climate_variable, ~fit,         ~component, ~base_term,
-      "precipitation",  fit_obj[[1]], "mn",      "std_log_annual_precipitation_mn",
-      "precipitation",  fit_obj[[1]], "c",       "std_log_annual_precipitation_c",
-      "temperature",    fit_obj[[2]], "mn",      "std_average_temperature_mn",
-      "temperature",    fit_obj[[2]], "c",       "std_average_temperature_c"
-    )
-  } else {
-    model_specs <- tribble(
-      ~climate_variable, ~fit,         ~component, ~base_term,
-      "precipitation",  fit_obj[[1]], "mn",      "std_log_annual_precipitation_mn",
-      "precipitation",  fit_obj[[1]], "c",       "std_log_annual_precipitation_c",
-      "temperature",    fit_obj[[1]], "mn",      "std_average_temperature_mn",
-      "temperature",    fit_obj[[1]], "c",       "std_average_temperature_c"
-    )
-  }
-
-  model_specs %>%
-    mutate(
-      slope_tests = pmap(
-        list(fit, base_term),
-        ~ bind_rows(
-          test_group_slope_zero(..1, ..2, "non-woody"),
-          test_group_slope_zero(..1, ..2, "woody")
-        )
-      )
-    ) %>%
-    select(-fit) %>%
-    unnest(slope_tests) %>%
-    mutate(
-      trait = trait,
-      estimate = round(estimate, 5),
-      std.error = round(std.error, 5),
-      z.value = round(z.value, 5),
-      p.value = round(p.value, 5)
-    ) %>%
-    select(trait, climate_variable, component, group, estimate, std.error, z.value, p.value, significant)
-}
-
-woody_slope_zero_tables <- list()
-
-for (fit_file in woody_fit_files) {
-  trait <- tools::file_path_sans_ext(basename(fit_file))
-  fit_obj <- readRDS(fit_file)
-
-  trait_tbl <- extract_trait_slope_tests(fit_obj, trait)
-  woody_slope_zero_tables[[trait]] <- trait_tbl
-
-  doc <- read_docx()
-  doc <- body_add_table(doc, value = trait_tbl, style = "table_template")
-  print(doc, target = paste0(trait, "_woody_group_slope_vs_zero_table.docx"))
-}
-
-woody_slope_zero_summary <- bind_rows(woody_slope_zero_tables)
-woody_slope_zero_summary %>% View()
 ```
 
 
 ```{r}
-source("R/fit_model2d_frequentist_4panel_woody.R")
+# Figure 4 fixed effects (frequentist woody-split models), one block per trait
+source("R/export_figure4_table.R")
 
-traits <- unique(data_traits_climate$trait_name)
-
-fit_model2d_frequentist_4panel_woody_out_prec <- list()
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)
-
-    if(trait %in% c("huber_value","wood_density")){
-  fit_model2d_frequentist_4panel_woody_out_prec[[trait]] <- fit_model2d_frequentist_4panel(data_model, ind_variable = "log_annual_precipitation", woody_colour = TRUE)} else{
-  fit_model2d_frequentist_4panel_woody_out_prec[[trait]] <- fit_model2d_frequentist_4panel_woody(data_model, ind_variable = "log_annual_precipitation")
-  }
-}
-
-top_row_b_woody_prec <- fit_model2d_frequentist_4panel_woody_out_prec[[2]][[2]]
-top_row_b_woody_prec[[1]] <- top_row_b_woody_prec[[1]] + labs(title = "Interspecific (turnover component)") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b_woody_prec[[2]] <- top_row_b_woody_prec[[2]] + labs(title = "Intraspecific component") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b_woody_prec[[3]] <- top_row_b_woody_prec[[3]] + labs(title = "Slope of components") + theme(plot.title = element_text(hjust = 0.5))
-patchwork::wrap_plots(list(top_row_b_woody_prec,
-fit_model2d_frequentist_4panel_woody_out_prec[[5]][[2]],fit_model2d_frequentist_4panel_woody_out_prec[[4]][[2]],fit_model2d_frequentist_4panel_woody_out_prec[[3]][[2]],fit_model2d_frequentist_4panel_woody_out_prec[[1]][[2]]), ncol = 1, guides = "collect", tag = "new") + plot_layout(heights = c(1.1, 1, 1, 1,1)) + plot_annotation(tag_levels = "a")
-ggsave("fit_model2d_4panel_precipitation6_frequentist_woody3.png", height = 12, width = 13.33)
-
-patchwork::wrap_plots(list(fit_model2d_frequentist_4panel_woody_out_prec[[2]][[1]],
-fit_model2d_frequentist_4panel_woody_out_prec[[4]][[1]],fit_model2d_frequentist_4panel_woody_out_prec[[3]][[1]],fit_model2d_frequentist_4panel_woody_out_prec[[1]][[1]]), ncol = 2, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
-
-ggsave("fit_model2d_4panel_precipitation_6_frequentist_woody_a.png", height = 8, width = 13.33)
-
-```
-
-```{r}
-fit_model2d_frequentist_4panel_woody_out_temp <- list()
-for (trait in traits) {
-  cat(trait, ":  ")
-  data_model <- data_traits_climate |>
-    filter(trait_name == trait)
-
-    if(trait %in% c("huber_value","wood_density")){
-  fit_model2d_frequentist_4panel_woody_out_temp[[trait]] <- fit_model2d_frequentist_4panel(data_model, ind_variable = "average_temperature", woody_colour = TRUE)} else{
-  fit_model2d_frequentist_4panel_woody_out_temp[[trait]] <- fit_model2d_frequentist_4panel_woody(data_model, ind_variable = "average_temperature")
-  }
-}
-
-top_row_b_woody_temp <- fit_model2d_frequentist_4panel_woody_out_temp[[2]][[2]]
-top_row_b_woody_temp[[1]] <- top_row_b_woody_temp[[1]] + labs(title = "Interspecific (turnover component)") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b_woody_temp[[2]] <- top_row_b_woody_temp[[2]] + labs(title = "Intraspecific component") + theme(plot.title = element_text(hjust = 0.5))
-top_row_b_woody_temp[[3]] <- top_row_b_woody_temp[[3]] + labs(title = "Slope of components") + theme(plot.title = element_text(hjust = 0.5))
-patchwork::wrap_plots(list(top_row_b_woody_temp,
-fit_model2d_frequentist_4panel_woody_out_temp[[5]][[2]],fit_model2d_frequentist_4panel_woody_out_temp[[4]][[2]],fit_model2d_frequentist_4panel_woody_out_temp[[3]][[2]],fit_model2d_frequentist_4panel_woody_out_temp[[1]][[2]]), ncol = 1, guides = "collect", tag = "new") + plot_layout(heights = c(1.1, 1, 1, 1,1)) + plot_annotation(tag_levels = "a")
-ggsave("fit_model2d_4panel_temperature6_frequentist_woody.png", height = 12, width = 13.33)
-
-patchwork::wrap_plots(list(fit_model2d_frequentist_4panel_woody_out_temp[[2]][[1]],
-fit_model2d_frequentist_4panel_woody_out_temp[[4]][[1]],fit_model2d_frequentist_4panel_woody_out_temp[[3]][[1]],fit_model2d_frequentist_4panel_woody_out_temp[[1]][[1]]), ncol = 2, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
-
-ggsave("fit_model2d_4panel_temperature6_frequentist_woody_a.png", height = 8, width = 13.33)
+export_figure4_table("outputs/tables/EDTable2.docx")
 ```
 
 
 ```{r}
-patchwork::wrap_plots(list(fit_model2d_frequentist_4panel_woody_out_prec[[1]],fit_model2d_frequentist_4panel_woody_out_prec[[2]],fit_model2d_frequentist_4panel_woody_out_prec[[3]],fit_model2d_frequentist_4panel_woody_out_prec[[4]], fit_model2d_frequentist_4panel_out_prec$wood_density, fit_model2d_frequentist_4panel_out_prec$huber_value, fit_model2d_frequentist_4panel_out_prec$leaf_P_per_area), ncol = 1, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
+# For each woody-split trait (Figure 4), test whether each growth form's across- and
+# within-species slope differs from zero (NOT whether woody differs from non-woody).
+source("R/export_figure4_table.R"); export_group_slope_table("outputs/tables/TableS5.docx")
 ```
 
+# Figure 2
 ```{r}
-ggsave("fit_model2d_4panel_precipitation6_frequentist_combo.png", height = 18, width = 13.33)
-```
+# Figure 2: within-species share of climate-associated trait
+# variation, S_w = k r / (k r + 1), with r = (B_w / B_m)^2 per posterior draw and k at its
+# observed value, var(Env_w) / var(Env_m). S_w draws are cached per trait in
+# outputs/model_fits/within_share/ (rebuilt automatically when a fit is newer).
+source("R/within_share.R")
 
-
-```{r}
-patchwork::wrap_plots(list(fit_model2d_frequentist_4panel_woody_out_temp[[1]],fit_model2d_frequentist_4panel_woody_out_temp[[2]],fit_model2d_frequentist_4panel_woody_out_temp[[3]],fit_model2d_frequentist_4panel_woody_out_temp[[4]], fit_model2d_frequentist_4panel_out_temp$wood_density, fit_model2d_frequentist_4panel_out_temp$huber_value, fit_model2d_frequentist_4panel_out_temp$leaf_P_per_area), ncol = 1, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
-```
-
-```{r}
-ggsave("fit_model2d_4panel_temperature6_frequentist_combo.png", height = 18, width = 13.33)
-```
-
-```{r}
-source("R/fit_model2d_bayesian_3panel_ratio_only.R")
-
-
-traits <- unique(data_traits_climate$trait_name)
-# traits <- traits[traits != "huber_value"]
 traits <- c("leaf_delta13C","leaf_area","leaf_mass_per_area","seed_dry_mass","leaf_N_per_area","huber_value","wood_density")
 
-fit_model2d_bayesian_3panel_prec <- list()
-# traits <- traits[5]
-for (trait in traits) {
-  cat(trait, ":  ")
+# Forest plots of S_w on a shared logit axis (most values lie close to 0), at the
+# observed k (floor)and k = 1 (ceiling)
+figure2 <- plot_within_share_forest(traits)
+ggsave("outputs/figures/Figure2.png", figure2, height = 6, width = 9)
+
+figureS4 <- plot_within_share_forest(traits, k = 1)
+ggsave("outputs/figures/FigureS4.png", figureS4, height = 6, width = 9)
+
+# S_w as k rises from the observed value to 1 (dense grid of 100 k values), with
+# 8 evenly spaced k values from observed to 1 marked as points
+within_share_curve <- plot_within_share_curve(traits, n_k = 100, k_mid = 0.5, n_points = 8)
+ggsave("outputs/figures/FigureS5.png", within_share_curve, height = 14, width = 9)
+
+# Supplementary tables for the S_w figures: observed k (with k and the Env_m-Env_w
+# orthogonality check) and k = 1
+export_within_share_table(traits, k = "observed", "outputs/tables/TableS2.docx")
+export_within_share_table(traits, k = 1, "outputs/tables/TableS7.docx")
+```
+
+```{r}
+# Combined-case metric: (intra slope / inter slope)^2 * (var(deviation from centroid) / var(centroids))
+# Using the all-species model only (combined case), summarised by the posterior median slopes.
+combined_trait_metric <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
   data_model <- data_traits_climate |>
     filter(trait_name == trait)
-  fit_model2d_bayesian_3panel_prec[[trait]] <- fit_model2d_bayesian_3panel_ratio_only(data_model, ind_variable = "log_annual_precipitation")
-}
 
+  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
 
-fit_model2d_bayesian_3panel_prec_for_plot <- purrr::imap(
-  fit_model2d_bayesian_3panel_prec,
-  function(plot_obj, trait) {
-    plot_index <- match(trait, names(fit_model2d_bayesian_3panel_prec))
-    n_plots <- length(fit_model2d_bayesian_3panel_prec)
+  bind_rows(
+    tibble(
+      trait = trait,
+      env = "MAP",
+      inter_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_mn"]]),
+      intra_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_c"]]),
+      var_centroids = var(data_model$std_log_annual_precipitation_mn, na.rm = TRUE),
+      var_deviations = var(data_model$std_log_annual_precipitation_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
 
-    if (plot_index != n_plots) {
-      plot_obj <- plot_obj +
-        theme(axis.title.x = element_blank())
-    }
+    tibble(
+      trait = trait,
+      env = "MAT",
+      inter_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_mn"]]),
+      intra_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_c"]]),
+      var_centroids = var(data_model$std_average_temperature_mn, na.rm = TRUE),
+      var_deviations = var(data_model$std_average_temperature_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids))
+  )
+}) |>
+  arrange(env, trait)
 
-    if (plot_index != 1) {
-      plot_obj <- plot_obj +
-        theme(
-          strip.text = element_blank(),
-          strip.background = element_blank()
-        )
-    }
+combined_trait_metric
 
-    plot_obj
-  }
-)
+combined_trait_metric <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
+  data_model <- data_traits_climate |>
+    filter(trait_name == trait)
 
+  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
 
-patchwork::wrap_plots(fit_model2d_bayesian_3panel_prec_for_plot, ncol = 1, guides = "collect", tag = "new") + plot_annotation(tag_levels = "a")
+  bind_rows(
+    tibble(
+      trait = trait,
+      env = "MAP",
+      inter_slope = (posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_mn"]]),
+      intra_slope = (posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_c"]]),
+      var_centroids = var(data_model$std_log_annual_precipitation_mn, na.rm = TRUE),
+      var_deviations = var(data_model$std_log_annual_precipitation_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
 
-ggsave("fit_model2d_bayesian_3panel_ratio_only_updated.png", height = 18*(7/7), width = 13.33*(2/3))
+    tibble(
+      trait = trait,
+      env = "MAT",
+      inter_slope = (posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_mn"]]),
+      intra_slope = (posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_c"]]),
+      var_centroids = var(data_model$std_average_temperature_mn, na.rm = TRUE),
+      var_deviations = var(data_model$std_average_temperature_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids))
+  )
+}) |>
+  arrange(env, trait)
+
+combined_trait_metric %>%
+      ggplot(aes(y = value, x = xpos,
+                 group = interaction(name), colour = "a", fill = "a")) +
+      geom_hline(yintercept = ref_line, linetype = "dashed") +
+      geom_violinhalf(aes(alpha = fill_status), flip = FALSE, width = 0.09,
+                      position = position_nudge(x = 0.08)) +
+      geom_segment(data = data_for_plot_group,
+                   aes(y = low_quantile, yend = upp_quantile, x = xpos),
+                   colour = "black", size = 1.2,
+                   position = position_nudge(x = 0.08)) +
+      geom_point(data = data_for_plot_group, aes(y = mean_value),
+                 colour = "black", position = position_nudge(x = 0.08)) +
+      # Median label placed above the violin half; nudge further than the violin (0.08) to avoid overlap
+      geom_text(data = data_for_plot_group,
+                aes(y = mean_value, label = sprintf("%.2f", mean_value)),
+                colour = "black", size = 3, position = position_nudge(x = 0.17)) +
+      facet_grid(~env) +
+      coord_flip() +
+      theme_bw() +
+      theme(legend.position = "none",
+            text = element_text(size = 12),
+            axis.text = element_text(size = 10.5),
+            axis.text.y = element_blank(),
+            strip.background = element_rect(fill = "white", colour = NA),
+            strip.text = element_text(size = 16)) +
+      scale_x_continuous(limits = c(1.55, 1.85)) +
+          labs(y = y_axis_label) +
+      xlab(trait_label) +
+          scale_y_continuous(limits = c(0, 1)) +
+        scale_alpha_manual(values = c("fill" = 0.5, "no_fill" = 0)) +
+      scale_colour_okabeito(order = c(6), breaks = c("a")) +
+      scale_fill_okabeito(order = c(6),   breaks = c("a")) 
+
 
 ```
 
 ```{r}
-asd <- compare_bayes_slope_ci_overlap()
+# Woody/non-woody split metric: (intra slope / inter slope)^2 * (var(deviation from centroid) / var(centroids))
+# Uses the group-specific posterior slopes from the woody interaction model. The all-species metric above is the combined-case analogue.
+woody_split_traits <- setdiff(unique(data_traits_climate$trait_name), c("huber_value", "wood_density"))
+
+woody_split_trait_metric <- map_dfr(woody_split_traits, function(trait) {
+  data_model <- data_traits_climate |>
+    filter(trait_name == trait)
+
+  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian_woody/", trait, ".RDS"))
+
+  draw_map <- posterior::as_draws_df(fits[[1]]) |> as_tibble()
+  draw_mat <- posterior::as_draws_df(fits[[2]]) |> as_tibble()
+
+  bind_rows(
+    tibble(
+      trait = trait,
+      group = "non-woody",
+      env = "MAP",
+      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]]),
+      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]]),
+      var_centroids = var((data_model |> filter(woody == "non-woody"))$std_log_annual_precipitation_mn, na.rm = TRUE),
+      var_deviations = var((data_model |> filter(woody == "non-woody"))$std_log_annual_precipitation_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
+
+    tibble(
+      trait = trait,
+      group = "woody",
+      env = "MAP",
+      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]] + draw_map[["b_std_log_annual_precipitation_mn:woodywoody"]]),
+      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]] + draw_map[["b_std_log_annual_precipitation_c:woodywoody"]]),
+      var_centroids = var((data_model |> filter(woody == "woody"))$std_log_annual_precipitation_mn, na.rm = TRUE),
+      var_deviations = var((data_model |> filter(woody == "woody"))$std_log_annual_precipitation_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
+
+    tibble(
+      trait = trait,
+      group = "non-woody",
+      env = "MAT",
+      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]]),
+      intra_slope = median(draw_mat[["b_std_average_temperature_c"]]),
+      var_centroids = var((data_model |> filter(woody == "non-woody"))$std_average_temperature_mn, na.rm = TRUE),
+      var_deviations = var((data_model |> filter(woody == "non-woody"))$std_average_temperature_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids)),
+
+    tibble(
+      trait = trait,
+      group = "woody",
+      env = "MAT",
+      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]] + draw_mat[["b_std_average_temperature_mn:woodywoody"]]),
+      intra_slope = median(draw_mat[["b_std_average_temperature_c"]] + draw_mat[["b_std_average_temperature_c:woodywoody"]]),
+      var_centroids = var((data_model |> filter(woody == "woody"))$std_average_temperature_mn, na.rm = TRUE),
+      var_deviations = var((data_model |> filter(woody == "woody"))$std_average_temperature_c, na.rm = TRUE)
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2 * (var_deviations / var_centroids))
+  )
+}) |>
+  arrange(env, trait, group)
+
+woody_split_trait_metric %>% 
+select(-inter_slope, -intra_slope)
+```
+
+```{r}
+# Slope-only versions of the same analyses: (intra slope / inter slope)^2
+# No variance terms included.
+combined_trait_slope_metric <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
+  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
+
+  bind_rows(
+    tibble(
+      trait = trait,
+      env = "MAP",
+      inter_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_mn"]]),
+      intra_slope = median(posterior::as_draws_df(fits[[1]])[["b_std_log_annual_precipitation_c"]])
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2),
+
+    tibble(
+      trait = trait,
+      env = "MAT",
+      inter_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_mn"]]),
+      intra_slope = median(posterior::as_draws_df(fits[[2]])[["b_std_average_temperature_c"]])
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2)
+  )
+}) |>
+  arrange(env, trait)
+
+combined_trait_slope_metric
+```
+
+```{r}
+# Slope-only versions of the woody/non-woody split: (intra slope / inter slope)^2
+woody_split_traits <- setdiff(unique(data_traits_climate$trait_name), c("huber_value", "wood_density"))
+
+woody_split_trait_slope_metric <- map_dfr(woody_split_traits, function(trait) {
+  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian_woody/", trait, ".RDS"))
+
+  draw_map <- posterior::as_draws_df(fits[[1]]) |> as_tibble()
+  draw_mat <- posterior::as_draws_df(fits[[2]]) |> as_tibble()
+
+  bind_rows(
+    tibble(
+      trait = trait,
+      group = "non-woody",
+      env = "MAP",
+      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]]),
+      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]])
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2),
+
+    tibble(
+      trait = trait,
+      group = "woody",
+      env = "MAP",
+      inter_slope = median(draw_map[["b_std_log_annual_precipitation_mn"]] + draw_map[["b_std_log_annual_precipitation_mn:woodywoody"]]),
+      intra_slope = median(draw_map[["b_std_log_annual_precipitation_c"]] + draw_map[["b_std_log_annual_precipitation_c:woodywoody"]])
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2),
+
+    tibble(
+      trait = trait,
+      group = "non-woody",
+      env = "MAT",
+      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]]),
+      intra_slope = median(draw_mat[["b_std_average_temperature_c"]])
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2),
+
+    tibble(
+      trait = trait,
+      group = "woody",
+      env = "MAT",
+      inter_slope = median(draw_mat[["b_std_average_temperature_mn"]] + draw_mat[["b_std_average_temperature_mn:woodywoody"]]),
+      intra_slope = median(draw_mat[["b_std_average_temperature_c"]] + draw_mat[["b_std_average_temperature_c:woodywoody"]])
+    ) |>
+      mutate(metric = (intra_slope / inter_slope)^2)
+  )
+}) |>
+  arrange(env, trait, group)
+
+woody_split_trait_slope_metric
+```
+
+```{r}
+# Figure 5-like plot of the metric components:
+# posterior distributions for inter- and intraspecific slopes, with the variance
+# component shown as a point estimate rather than a posterior distribution.
+trait_order <- c(
+  "leaf_N_per_area",
+  "leaf_delta13C",
+  "leaf_mass_per_area",
+  "seed_dry_mass",
+  "leaf_area",
+  "wood_density",
+  "huber_value"
+)
+
+combined_metric_slope_draws <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
+  fits <- readRDS(paste0("outputs/model_fits/fit2d_bayesian/", trait, ".RDS"))
+
+  draw_map <- posterior::as_draws_df(fits[[1]]) |> as_tibble()
+  draw_mat <- posterior::as_draws_df(fits[[2]]) |> as_tibble()
+
+  bind_rows(
+    tibble(
+      trait = trait,
+      env = "MAP",
+      term = "inter",
+      value = draw_map[["b_std_log_annual_precipitation_mn"]]
+    ),
+    tibble(
+      trait = trait,
+      env = "MAP",
+      term = "intra",
+      value = draw_map[["b_std_log_annual_precipitation_c"]]
+    ),
+    tibble(
+      trait = trait,
+      env = "MAT",
+      term = "inter",
+      value = draw_mat[["b_std_average_temperature_mn"]]
+    ),
+    tibble(
+      trait = trait,
+      env = "MAT",
+      term = "intra",
+      value = draw_mat[["b_std_average_temperature_c"]]
+    )
+  )
+}) |>
+  mutate(trait = factor(trait, levels = trait_order))
+
+combined_metric_var_est <- map_dfr(unique(data_traits_climate$trait_name), function(trait) {
+  data_model <- data_traits_climate |>
+    filter(trait_name == trait)
+
+  bind_rows(
+    tibble(
+      trait = trait,
+      env = "MAP",
+      term = "variance",
+      value = var(data_model$std_log_annual_precipitation_c, na.rm = TRUE) /
+        var(data_model$std_log_annual_precipitation_mn, na.rm = TRUE)
+    ),
+    tibble(
+      trait = trait,
+      env = "MAT",
+      term = "variance",
+      value = var(data_model$std_average_temperature_c, na.rm = TRUE) /
+        var(data_model$std_average_temperature_mn, na.rm = TRUE)
+    )
+  )
+}) |>
+  mutate(trait = factor(trait, levels = trait_order))
+
+combined_metric_plot <- ggplot() +
+  geom_violin(
+    data = combined_metric_slope_draws,
+    aes(x = trait, y = value, fill = term),
+    trim = FALSE,
+    alpha = 0.7,
+    width = 0.9
+  ) +
+  geom_point(
+    data = combined_metric_var_est,
+    aes(x = trait, y = value, colour = term),
+    size = 2.5,
+    alpha = 0.9
+  ) +
+  facet_grid(term ~ env, scales = "free_y") +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    text = element_text(size = 12),
+    axis.text = element_text(size = 10.5),
+    axis.title.x = element_blank(),
+    strip.background = element_rect(fill = "white", colour = NA),
+    strip.text = element_text(size = 12)
+  ) +
+  labs(y = "Value") +
+  xlab("Trait") +
+  scale_fill_okabeito(order = c(1, 2), breaks = c("inter", "intra")) +
+  scale_colour_okabeito(order = c(3), breaks = c("variance"))
+
+combined_metric_plot
 ```
