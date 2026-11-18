@@ -3,3 +3,6 @@ downloads
 outputs/*
 Analysis.qmd
 .Rproj.user
+*.png
+*.RDS
+*.docx
